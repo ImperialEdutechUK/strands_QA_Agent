@@ -22,6 +22,16 @@ MAX_IMAGE_HEIGHT = 18 * cm
 PX_TO_PT = 72.0 / 96.0  # 96 dpi screen px → 72 dpi PDF pt
 
 SEVERITY_COLOURS = {"Critical": "#c0392b", "Minor": "#d68910", "Info": "#2874a6"}
+VERDICT_COLOURS = {"PASS": "#1e8449", "PARTIAL": "#d68910", "FAIL": "#c0392b"}
+
+
+def _html_escape(text: str) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 def _count_severities(issues: list[dict]) -> dict[str, int]:
@@ -57,6 +67,30 @@ def generate_pdf(report: dict, out_path: str) -> str:
     if report.get("template_summary"):
         flow.append(Spacer(1, 0.3 * cm))
         flow.append(Paragraph(f"<b>Template:</b> {report['template_summary']}", styles["Normal"]))
+
+    reasoning = report.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning:
+        verdict = str(reasoning.get("verdict", "")).upper() or "PARTIAL"
+        v_colour = VERDICT_COLOURS.get(verdict, "#333333")
+        flow.append(Spacer(1, 0.5 * cm))
+        flow.append(Paragraph("Agent self-review", styles["Heading2"]))
+        flow.append(Paragraph(
+            f"<b>Verdict:</b> <font color='{v_colour}'>{verdict}</font>",
+            styles["Normal"],
+        ))
+        if reasoning.get("summary"):
+            flow.append(Paragraph(
+                f"<b>Summary:</b> {_html_escape(reasoning['summary'])}",
+                styles["Normal"],
+            ))
+        if reasoning.get("instructions_followed"):
+            flow.append(Paragraph("<b>Instructions followed:</b>", styles["Normal"]))
+            for item in reasoning["instructions_followed"]:
+                flow.append(Paragraph(f"• {_html_escape(item)}", styles["Normal"]))
+        if reasoning.get("gaps"):
+            flow.append(Paragraph("<b>Gaps:</b>", styles["Normal"]))
+            for item in reasoning["gaps"]:
+                flow.append(Paragraph(f"• {_html_escape(item)}", styles["Normal"]))
 
     for i, issue in enumerate(issues, start=1):
         flow.append(PageBreak())

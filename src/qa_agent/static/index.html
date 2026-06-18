@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Strands QA Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>Strands QA Agent</h1>
+      <p class="tagline">Audit a course page for spelling, grammar &amp; template compliance.</p>
+    </div>
+    <div id="status" class="status status--unknown" title="MCP server status">
+      <span class="dot"></span><span class="label">checking…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <form id="qa-form">
+        <label class="field">
+          <span class="field__label">Course URL <span class="req">*</span></span>
+          <input type="url" name="url" id="url" required
+                 placeholder="https://example.com/course/your-course">
+        </label>
+
+        <fieldset class="field">
+          <legend class="field__label">QA template (optional)</legend>
+          <p class="field__hint">Provide either inline text rules <em>or</em> upload a template document.</p>
+
+          <label class="subfield">
+            <span>Template text</span>
+            <textarea name="template_text" id="template_text" rows="4"
+                      placeholder="e.g. All headings sentence case. Page must include learning outcomes and price."></textarea>
+          </label>
+
+          <label class="subfield">
+            <span>Template document</span>
+            <input type="file" name="template_document" id="template_document"
+                   accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.tif,.gif">
+            <span class="field__hint">PDF, Word .docx, or image. The document's text and any embedded images are extracted (OCR'd) and used as the rules. PDFs/DOCX ≤ 20 MB; images ≤ 10 MB. Requires Tesseract on the server.</span>
+          </label>
+        </fieldset>
+
+        <div class="actions">
+          <button type="submit" id="run">Run QA</button>
+          <button type="button" id="reset" class="secondary">Reset</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="progress" class="card hidden">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <strong>Running QA agent…</strong>
+        <p class="muted">This typically takes 1–3 minutes. The agent calls
+          scrape → template → spell → compliance → evidence in sequence.</p>
+        <p class="muted" id="progress-elapsed">elapsed: 0s</p>
+      </div>
+    </section>
+
+    <section id="error" class="card error hidden">
+      <h2>Run failed</h2>
+      <pre id="error-body"></pre>
+    </section>
+
+    <section id="report" class="card hidden">
+      <header class="report__header">
+        <div>
+          <h2 id="report-title">Report</h2>
+          <p class="muted" id="report-meta"></p>
+        </div>
+        <div class="report__downloads">
+          <a id="dl-json" class="btn secondary" download>Download JSON</a>
+          <a id="dl-pdf" class="btn" download>Download PDF</a>
+        </div>
+      </header>
+
+      <div id="report-summary" class="summary"></div>
+      <div id="report-failures" class="failures hidden"></div>
+      <section id="report-reasoning" class="reasoning hidden">
+        <header class="reasoning__head">
+          <h3>Agent self-review</h3>
+          <span id="reasoning-verdict" class="verdict"></span>
+        </header>
+        <p id="reasoning-summary" class="muted"></p>
+        <div class="reasoning__lists">
+          <div>
+            <h4>Instructions followed</h4>
+            <ul id="reasoning-followed"></ul>
+          </div>
+          <div>
+            <h4>Gaps</h4>
+            <ul id="reasoning-gaps"></ul>
+          </div>
+        </div>
+      </section>
+      <div id="report-issues"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Backend: <code id="be-url"></code></span>
+    <span>MCP: <code id="mcp-url"></code></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

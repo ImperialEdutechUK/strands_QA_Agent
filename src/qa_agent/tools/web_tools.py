@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import re
+import tempfile
+from pathlib import Path
 from typing import Callable, TypeVar
 
 from io import BytesIO
@@ -19,6 +22,35 @@ T = TypeVar("T")
 NAV_TIMEOUT_MS = 45_000
 LOAD_BEST_EFFORT_MS = 8_000
 VIEWPORT = {"width": 1440, "height": 900}
+
+# The full page text is fetched and stored locally, but the slice we hand back
+# to the agent is capped — every byte we return ends up in the LLM context
+# twice (once as a tool result, once when re-passed to spell/compliance), which
+# makes long pages tip OpenRouter into "Network connection lost" mid-stream.
+SCRAPE_TEXT_LLM_CAP = 8_000
+SCRAPE_TEXT_HEAD_CHUNK = 6000
+SCRAPE_TEXT_TAIL_CHUNK = 2000
+
+PRICE_SELECTOR_CANDIDATES = (
+    "[class*=price]",
+    "[id*=price]",
+    "[class*=cost]",
+    "[id*=cost]",
+    "[class*=fee]",
+    "[id*=fee]",
+    "[class*=sidebar]",
+    "[id*=sidebar]",
+    "aside",
+)
+
+_PRICE_RE = re.compile(
+    r'''
+    (?:£|GBP|EUR|€|USD|\$)\s?\d[\d,]*(?:\.\d{1,2})?
+    |
+    \d[\d,]*\s?(?:GBP|USD|EUR|pounds|pound|£|€|usd|eur|gbp)
+    ''',
+    re.I | re.X,
+)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -99,6 +131,57 @@ def _navigate(page: Page, url: str) -> None:
         logger.debug("overlay hide failed (continuing): %s", exc)
 
 
+def _cap_text(text: str) -> str:
+    if len(text) <= SCRAPE_TEXT_LLM_CAP:
+        return text
+    return (
+        text[:SCRAPE_TEXT_HEAD_CHUNK]
+        + "\n\n... [content truncated; tail preserved] ...\n\n"
+        + text[-SCRAPE_TEXT_TAIL_CHUNK:]
+    )
+
+
+def _extract_price_snippets(page: Page) -> list[str]:
+    snippets: list[str] = []
+    seen: set[str] = set()
+
+    def push(text: str) -> None:
+        normalized = text.strip()
+        if len(normalized) >= 4 and normalized not in seen:
+            seen.add(normalized)
+            snippets.append(normalized)
+
+    for selector in PRICE_SELECTOR_CANDIDATES:
+        try:
+            elements = page.query_selector_all(selector)
+        except Exception:
+            continue
+        for el in elements:
+            try:
+                text = el.inner_text().strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            for match in _PRICE_RE.findall(text):
+                push(text)
+                break
+
+    if not snippets:
+        # Fallback: grep the whole page text for obvious pricing strings.
+        try:
+            text = page.inner_text("body") or ""
+        except Exception:
+            text = ""
+        for match in _PRICE_RE.findall(text):
+            sample = text[max(0, text.index(match) - 40): text.index(match) + len(match) + 40]
+            push(sample)
+            if len(snippets) >= 6:
+                break
+
+    return snippets
+
+
 def _with_page(url: str, fn: Callable[[Page], T]) -> T:
     safe_url = validate_public_url(url)
     with sync_playwright() as p:
@@ -112,32 +195,37 @@ def _with_page(url: str, fn: Callable[[Page], T]) -> T:
 
 def scrape_page(url: str) -> dict:
     def _scrape(page: Page) -> dict:
+        full_text = page.inner_text("body") or ""
+        capped_text = _cap_text(full_text)
         return {
             "url": url,
             "title": page.title(),
-            "text": page.inner_text("body"),
+            "text": capped_text,
+            "text_truncated": len(full_text) > SCRAPE_TEXT_LLM_CAP,
+            "text_total_chars": len(full_text),
             "headings": page.eval_on_selector_all(
                 "h1, h2, h3",
                 "els => els.map(e => ({tag: e.tagName.toLowerCase(), text: e.innerText.trim()}))",
             ),
             "links": page.eval_on_selector_all(
                 "a[href]",
-                "els => els.slice(0, 200).map(e => ({text: e.innerText.trim(), href: e.getAttribute('href')}))",
+                "els => els.slice(0, 80).map(e => ({text: e.innerText.trim(), href: e.getAttribute('href')}))",
             ),
             "images": page.eval_on_selector_all(
                 "img",
-                "els => els.slice(0, 200).map(e => ({alt: e.getAttribute('alt') || '', src: e.getAttribute('src')}))",
+                "els => els.slice(0, 80).map(e => ({alt: e.getAttribute('alt') || '', src: e.getAttribute('src')}))",
             ),
+            "price_candidates": _extract_price_snippets(page),
         }
 
     return _with_page(url, _scrape)
 
 
 def take_screenshot(url: str, selector: str | None = None, full_page: bool = True) -> str:
-    """Full-page or selector-based screenshot. Kept for `--agent` mode and manual use.
+    """Full-page or selector-based screenshot.
 
-    The pipeline uses `capture_excerpts` instead, which produces focused per-issue
-    crops rather than a single huge full-page image.
+    Kept available as an MCP tool but the agent prompt steers towards
+    `capture_excerpts`, which yields focused per-issue crops.
     """
     def _shot(page: Page) -> str:
         if selector:
@@ -290,8 +378,49 @@ def _capture_excerpt(page: Page, excerpt: str) -> str | None:
     return base64.b64encode(buf).decode()
 
 
+EVIDENCE_TOKEN_PREFIX = "evidence://"
+
+
+def _evidence_dir() -> Path:
+    d = Path(tempfile.gettempdir()) / "qa_agent_evidence"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _store_evidence_png(b64: str) -> str:
+    """Persist a base64 PNG to the evidence cache and return an opaque token.
+
+    Tokens are content-addressed (sha256) so the same screenshot is stored once.
+    Callers exchange tokens for the actual PNG via `read_evidence_png`.
+    """
+    raw = base64.b64decode(b64)
+    digest = hashlib.sha256(raw).hexdigest()
+    path = _evidence_dir() / f"{digest}.png"
+    if not path.exists():
+        path.write_bytes(raw)
+    return f"{EVIDENCE_TOKEN_PREFIX}{digest}"
+
+
+def read_evidence_png(token: str) -> str | None:
+    """Resolve an `evidence://<sha256>` token back to a base64 PNG, or None."""
+    if not isinstance(token, str) or not token.startswith(EVIDENCE_TOKEN_PREFIX):
+        return None
+    digest = token[len(EVIDENCE_TOKEN_PREFIX):].strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    path = _evidence_dir() / f"{digest}.png"
+    if not path.exists():
+        return None
+    return base64.b64encode(path.read_bytes()).decode()
+
+
 def capture_excerpts(url: str, excerpts: list[str]) -> dict[str, str]:
-    """Open `url` once and return {excerpt: base64 PNG} for each unique non-empty excerpt.
+    """Open `url` once and return {excerpt: evidence_token} for each unique non-empty excerpt.
+
+    Tokens are tiny opaque strings (`evidence://<sha256>`); the underlying PNGs are
+    cached on disk and resolved by `read_evidence_png`. Returning tokens (not
+    base64) keeps the LLM's tool-result context small enough for the model to
+    produce a final JSON without truncating or erroring on context size.
 
     Excerpts that can't be located are silently omitted from the returned dict.
     """
@@ -315,9 +444,9 @@ def capture_excerpts(url: str, excerpts: list[str]) -> dict[str, str]:
         try:
             _navigate(page, safe_url)
             for excerpt in deduped:
-                shot = _capture_excerpt(page, excerpt)
-                if shot:
-                    out[excerpt] = shot
+                shot_b64 = _capture_excerpt(page, excerpt)
+                if shot_b64:
+                    out[excerpt] = _store_evidence_png(shot_b64)
         finally:
             browser.close()
     return out

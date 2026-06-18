@@ -9,6 +9,7 @@ import re
 
 import httpx
 
+from .provider_policy import openrouter_provider_block
 from .security import MAX_HTTP_RESPONSE_BYTES, redact, require_env, truncate_text
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,9 @@ def call_llm(
         "model": os.environ.get("MODEL", "deepseek/deepseek-v3.2"),
         "messages": messages,
         "temperature": temperature,
+        # Restrict OpenRouter to GDPR-jurisdiction, no-data-collection providers
+        # and block Chinese-jurisdiction ones. See provider_policy.py.
+        "provider": openrouter_provider_block(),
     }
     if json_mode:
         body["response_format"] = {"type": "json_object"}

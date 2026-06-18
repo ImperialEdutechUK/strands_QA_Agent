@@ -24,6 +24,13 @@ MAX_HTTP_RESPONSE_BYTES = int(os.environ.get("QA_MAX_HTTP_RESPONSE_BYTES", str(2
 
 ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 ALLOWED_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"})
+ALLOWED_DOC_SUFFIXES = frozenset({".pdf", ".docx"})
+# Template uploads now accept either an image OR a document (PDF / Word).
+ALLOWED_TEMPLATE_SUFFIXES = ALLOWED_IMAGE_SUFFIXES | ALLOWED_DOC_SUFFIXES
+# Documents (esp. PDF) can be larger than a single screenshot. Cap separately
+# from MAX_IMAGE_BYTES so a malicious upload still has a bound, but a real
+# multi-page brief isn't rejected at the door.
+MAX_DOC_BYTES = int(os.environ.get("QA_MAX_DOC_BYTES", str(20 * 1024 * 1024)))  # 20 MiB
 
 # Optional whitelist of directories template files may be loaded from.
 # Defaults to the project's `templates/` directory plus the current working dir.
@@ -91,24 +98,30 @@ class UnsafePathError(ValueError):
 
 
 def safe_resolve_template(path_str: str) -> Path:
-    """Resolve a template image path, refusing traversal and unknown extensions.
+    """Resolve a template path, refusing traversal and unknown extensions.
 
-    The resolved path must live under one of the allowed template roots (project
-    cwd, ./templates, or directories listed in QA_TEMPLATE_DIRS).
+    Accepts both image templates (PNG / JPEG / WebP / etc) and document
+    templates (PDF / DOCX). Size limits are applied per-class — images are
+    capped at MAX_IMAGE_BYTES, documents at MAX_DOC_BYTES. The resolved
+    path must live under one of the allowed template roots (project cwd,
+    ./templates, or directories listed in QA_TEMPLATE_DIRS).
     """
     if not path_str or not isinstance(path_str, str):
         raise UnsafePathError("Template path must be a non-empty string.")
     candidate = Path(path_str).expanduser().resolve()
     if not candidate.exists() or not candidate.is_file():
         raise UnsafePathError(f"Template file not found: {path_str}")
-    if candidate.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
+    suffix = candidate.suffix.lower()
+    if suffix not in ALLOWED_TEMPLATE_SUFFIXES:
         raise UnsafePathError(
-            f"Template extension '{candidate.suffix}' is not in the allowed set "
-            f"{sorted(ALLOWED_IMAGE_SUFFIXES)}."
+            f"Template extension '{suffix}' is not in the allowed set "
+            f"{sorted(ALLOWED_TEMPLATE_SUFFIXES)}."
         )
-    if candidate.stat().st_size > MAX_IMAGE_BYTES:
+    size = candidate.stat().st_size
+    cap = MAX_DOC_BYTES if suffix in ALLOWED_DOC_SUFFIXES else MAX_IMAGE_BYTES
+    if size > cap:
         raise UnsafePathError(
-            f"Template image exceeds {MAX_IMAGE_BYTES} bytes ({candidate.stat().st_size})."
+            f"Template file exceeds {cap} bytes ({size})."
         )
     roots = _allowed_template_roots()
     if not any(_is_within(candidate, r) for r in roots):

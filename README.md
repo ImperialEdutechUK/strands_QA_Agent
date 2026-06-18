@@ -25,7 +25,6 @@ See [Instruction_guide.md](Instruction_guide.md) for the architecture walkthroug
     ├── llm_client.py         # Direct OpenRouter client for structured-JSON tools
     ├── mcp_server.py         # FastMCP server exposing the QA tools
     ├── agent.py              # Strands Agent + MCPClient wiring
-    ├── pipeline.py           # Deterministic non-LLM pipeline (CI mode)
     ├── main.py               # CLI entry point
     ├── security.py           # SSRF / path / secret / redaction helpers
     ├── logging_config.py     # Logging with secret redaction
@@ -80,23 +79,20 @@ You should see `MCP Server running on http://localhost:3001/mcp`.
 
 **Terminal 2 — agent CLI:**
 ```bash
-# Default: deterministic pipeline (3 LLM calls — recommended)
+# URL only — the Strands agent picks the tool sequence
 python -m qa_agent.main --url https://example.com/your-course
 
 # With a text template
 python -m qa_agent.main --url https://example.com/your-course \
   --template-text "All headings sentence case. Page must include learning outcomes."
 
-# With an image-based QA template (needs Tesseract installed)
-python -m qa_agent.main --url https://example.com/your-course --template ./qa-template.png
-
-# Strands agent mode — LLM picks tools (more LLM calls, more flexible)
-python -m qa_agent.main --url https://example.com/your-course --agent
+# With a template file (image, PDF, or Word docx; images need Tesseract installed)
+python -m qa_agent.main --url https://example.com/your-course --template ./qa-template.pdf
 ```
 
-> **Cost note:** the default pipeline makes exactly 3 LLM calls (template ×1,
-> spell ×1, compliance ×1). The `--agent` mode adds orchestration calls on top
-> and is harder to bound. Use the default unless you need adaptive tool routing.
+> **Cost note:** the agent orchestrates each MCP tool call itself, so a run
+> uses several LLM calls (one per tool step plus orchestration). The system
+> prompt restricts each tool to one call per run to keep cost bounded.
 
 Outputs land in `reports/qa-report-<timestamp>.json` and `.pdf`.
 
@@ -111,15 +107,12 @@ Outputs land in `reports/qa-report-<timestamp>.json` and `.pdf`.
 4. The **CLI** (`main.py`) writes both a JSON report and a PDF (`report_tool.py`,
    ReportLab) into `reports/`.
 
-## Why two execution modes?
+## Execution model
 
-- **Default (deterministic pipeline)** — `pipeline.py` calls the tool functions
-  directly in a fixed order. Cheapest, most predictable, best for CI.
-- **`--agent` (Strands agent mode)** — the LLM orchestrates the tool calls. More
-  flexible (skips steps, adapts to failures), but uses more tokens. The system
-  prompt forces it to call each tool at most once and stop on first success.
-
-Both produce the same report shape.
+The CLI runs a single execution path: the **Strands agent** orchestrates the
+MCP tools (`scrape`, `template`, `spell`, `compliance`, `evidence`) under a
+strict system prompt that calls each tool at most once and emits one JSON
+object at the end. The CLI parses that JSON, persists it, and renders the PDF.
 
 ## Security
 

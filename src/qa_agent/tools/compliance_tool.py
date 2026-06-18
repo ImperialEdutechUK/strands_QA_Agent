@@ -26,7 +26,14 @@ SCHEMA_INSTRUCTION = """Return a JSON object:
 Output ONLY the JSON object. If the page passes every rule, return {"issues": []}."""
 
 
-def check_compliance(page_text: str, headings: list, rules: list) -> dict:
+def _format_price_candidates(price_candidates: list[str] | None) -> str:
+    if not price_candidates:
+        return "(none)"
+    return "\n".join(f"- {c}" for c in price_candidates[:8])
+
+
+def check_compliance(page_text: str, headings: list, rules: list,
+                     price_candidates: list[str] | None = None) -> dict:
     if not rules:
         return {"issues": []}
     compact_headings = "\n".join(f"{h.get('tag', '').upper()}: {h.get('text', '')}" for h in (headings or []))
@@ -34,6 +41,7 @@ def check_compliance(page_text: str, headings: list, rules: list) -> dict:
         f"{SCHEMA_INSTRUCTION}\n\n"
         f"TEMPLATE RULES:\n{json.dumps(rules, indent=2)}\n\n"
         f"PAGE HEADINGS:\n{compact_headings or '(none)'}\n\n"
+        f'PRICE CANDIDATES:\n{_format_price_candidates(price_candidates)}\n\n'
         f'PAGE TEXT (truncated):\n"""{(page_text or "")[:8000]}"""'
     )
     result = call_llm_json(prompt, system=SYSTEM)

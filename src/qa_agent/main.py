@@ -1,8 +1,8 @@
 """CLI entry point.
 
-Default mode is the **deterministic pipeline** — exactly 3 LLM calls
-(template → spell → compliance) and no agent-driven retries. Use ``--agent``
-to opt into the LLM-orchestrated Strands agent (more flexible, more tokens).
+Runs the **Strands agent** end-to-end: the LLM orchestrates the QA tools
+exposed by the MCP server (scrape -> template -> spell -> compliance ->
+evidence) and returns a single JSON report which is then rendered to PDF.
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ import click
 from dotenv import load_dotenv
 
 from .logging_config import configure_logging
-from .pipeline import run_pipeline
 from .security import redact
 from .tools.report_tool import generate_pdf
+from .tools.web_tools import EVIDENCE_TOKEN_PREFIX, read_evidence_png
 
 load_dotenv()
 configure_logging()
@@ -27,26 +27,17 @@ configure_logging()
 
 @click.command()
 @click.option("--url", "-u", required=True, help="Course page URL to QA.")
-@click.option("--template", "-t", "template_path", default=None, help="Path to a QA template image.")
+@click.option("--template", "-t", "template_path", default=None,
+              help="Path to a QA template file (image, PDF, or Word document).")
 @click.option("--template-text", default=None, help="Inline QA template text (alternative to --template).")
 @click.option("--out", "-o", default=None, help="Output PDF path (defaults to reports/qa-report-<ts>.pdf).")
-@click.option("--agent", "use_agent", is_flag=True, default=False,
-              help="Use the LLM-orchestrated Strands agent (more LLM calls). "
-                   "Default is the deterministic pipeline.")
-@click.option("--auto-fallback", is_flag=True, default=False,
-              help="If --agent fails to return JSON, also run the pipeline. "
-                   "Off by default (running both costs LLM calls twice).")
-def main(url: str, template_path: str | None, template_text: str | None,
-         out: str | None, use_agent: bool, auto_fallback: bool) -> None:
-    if use_agent:
-        report = _run_with_agent(
-            url=url,
-            template_path=template_path,
-            template_text=template_text,
-            auto_fallback=auto_fallback,
-        )
-    else:
-        report = run_pipeline(url=url, template_path=template_path, template_text=template_text)
+def main(url: str, template_path: str | None, template_text: str | None, out: str | None) -> None:
+    report = _run_with_agent(
+        url=url,
+        template_path=template_path,
+        template_text=template_text,
+    )
+    _resolve_evidence_tokens(report)
 
     reports_dir = Path("reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -63,14 +54,45 @@ def main(url: str, template_path: str | None, template_text: str | None,
     click.echo(f"  Issues: {len(report.get('issues', []))}")
 
 
-def _run_with_agent(url: str, template_path: str | None, template_text: str | None,
-                    auto_fallback: bool) -> dict:
-    from .agent import build_agent, build_user_prompt
+def _resolve_evidence_tokens(report: dict) -> None:
+    """Replace each issue's `evidence://...` screenshot token with base64 PNG.
+
+    The agent emits opaque tokens to keep the LLM's context small; the PDF
+    generator and downstream consumers expect inline base64. Tokens that can't
+    be resolved are dropped from the issue so the PDF doesn't try to embed them.
+    """
+    for issue in report.get("issues", []) or []:
+        token = issue.get("screenshot")
+        if not isinstance(token, str) or not token.startswith(EVIDENCE_TOKEN_PREFIX):
+            continue
+        b64 = read_evidence_png(token)
+        if b64:
+            issue["screenshot"] = b64
+        else:
+            issue.pop("screenshot", None)
+
+
+def _run_with_agent(url: str, template_path: str | None, template_text: str | None) -> dict:
+    from .agent import build_agent, build_user_prompt, invoke_with_retry
 
     with build_agent() as (agent, _client):
         prompt = build_user_prompt(url, template_path, template_text)
-        click.echo("Running Strands agent (use --pipeline / default for fewer LLM calls)...")
-        result = agent(prompt)
+        click.echo("Running Strands agent...")
+        try:
+            result = invoke_with_retry(agent, prompt)
+        except Exception as exc:
+            # Provider-side hiccups (DeepSeek/OpenRouter occasional 5xx, dropped
+            # streams, etc) shouldn't lose the run — emit a stub report with
+            # the error so the artifact pipeline still produces a JSON+PDF.
+            click.echo(f"Agent run failed mid-flight: {redact(str(exc))}", err=True)
+            return {
+                "course_name": "QA run incomplete",
+                "url": url,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "template_summary": None,
+                "issues": [],
+                "tool_failures": [f"agent: {type(exc).__name__}: {redact(str(exc))}"],
+            }
 
     text = str(result)
     try:
@@ -82,12 +104,9 @@ def _run_with_agent(url: str, template_path: str | None, template_text: str | No
                 return json.loads(match.group(0))
             except json.JSONDecodeError:
                 pass
-        if auto_fallback:
-            click.echo("Agent did not return JSON; --auto-fallback set, running pipeline.", err=True)
-            return run_pipeline(url=url, template_path=template_path, template_text=template_text)
         click.echo(
-            "Agent did not return JSON. Skipping pipeline fallback to save LLM calls.\n"
-            "Re-run with the default (pipeline) mode, or pass --auto-fallback to retry automatically.",
+            "Agent did not return valid JSON. Returning a stub report so the run "
+            "still produces an artifact you can inspect.",
             err=True,
         )
         return {
