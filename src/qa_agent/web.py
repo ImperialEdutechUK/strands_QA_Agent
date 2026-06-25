@@ -19,9 +19,9 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
-import httpx
 from dotenv import load_dotenv
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
@@ -43,7 +43,11 @@ from .security import (
     validate_public_url,
 )
 from .tools.report_tool import generate_pdf
-from .tools.web_tools import EVIDENCE_TOKEN_PREFIX, read_evidence_png
+from .tools.web_tools import (
+    EVIDENCE_TOKEN_PREFIX,
+    attach_issue_screenshots,
+    read_evidence_png,
+)
 
 load_dotenv()
 configure_logging()
@@ -123,6 +127,11 @@ def _run_agent_sync(url: str, template_path: str | None, template_text: str | No
             "raw_agent_output": text,
         }
 
+    # Make sure the page URL is set so screenshot capture (below) has a target,
+    # then attach a cropped screenshot to every issue from its excerpt. Done in
+    # this worker thread because Playwright cannot run in the async event loop.
+    report.setdefault("url", url)
+    attach_issue_screenshots(report)
     return report
 
 
@@ -131,16 +140,32 @@ async def index(_request: Request) -> Response:
 
 
 async def health(_request: Request) -> JSONResponse:
-    """Quick liveness probe + can-we-talk-to-MCP check."""
+    """Quick liveness probe + can-we-talk-to-MCP check.
+
+    We check whether the MCP port is *listening* with a plain TCP connect rather
+    than issuing an HTTP GET. A bare GET to the streamable-HTTP `/mcp` endpoint
+    makes the server spin up a new transport/session and then reply 406 Not
+    Acceptable (it expects an SSE `Accept` header) — so the old probe leaked a
+    session and logged a 406 on every 15-second poll. A TCP connect proves the
+    server is up without touching MCP's request machinery, keeping the logs clean.
+    """
+    parsed = urlparse(MCP_URL)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
     mcp_ok = False
     mcp_status: int | str = "unreachable"
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            # MCP returns 406 on a bare GET (it wants a streamable session) but
-            # any HTTP response means the server is up.
-            r = await client.get(MCP_URL)
-            mcp_status = r.status_code
-            mcp_ok = True
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=3.0
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001 - best-effort socket teardown
+            pass
+        mcp_ok = True
+        mcp_status = "listening"
     except Exception as exc:
         mcp_status = redact(str(exc))
 

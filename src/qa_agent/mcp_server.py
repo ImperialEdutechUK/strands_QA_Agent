@@ -17,10 +17,12 @@ import os
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+from .extraction import extract_page_summary, get_cached_extraction
 from .logging_config import configure_logging
 from .security import constant_time_equals, redact
 from .tools.compliance_tool import check_compliance
 from .tools.reasoning_tool import review_findings
+from .tools.spec_tool import lookup_specification
 from .tools.spell_tool import check_spelling
 from .tools.template_tool import analyse_template, analyse_template_text
 from .tools.web_tools import capture_excerpts, scrape_page, take_screenshot
@@ -54,6 +56,41 @@ async def scrape(url: str, auth_token: str | None = None) -> dict:
 
 
 @mcp.tool()
+async def extract(url: str, use_wordpress: bool = True, capture_screenshots: bool = True,
+                  run_ocr: bool = True, auth_token: str | None = None) -> dict:
+    """Layered QA-evidence extraction for a course page.
+
+    Collects detailed, evidence-based website content for later comparison
+    against QA template rules:
+
+      * WordPress REST API metadata (title, slug, content, featured media,
+        alt text, captions, modified date) where the site exposes it;
+      * rendered-DOM content (JS-rendered text, lazy images, sliders, banners,
+        accordions, tabs, page-builder sections);
+      * images from <img>, <picture>/srcset, lazy data-* attributes, CSS/inline
+        background images and page-builder backgrounds;
+      * all carousel slides (not just the first), banners (hero, promotional,
+        carousel, sidebar, popup, footer, trust/accreditation);
+      * element screenshots as evidence and OCR of text baked into images;
+      * per-element claim detection (price, discount, duration, certification,
+        accreditation, awarding body, eligibility, guarantee, rating, urgency,
+        learner numbers) and QA-priority scoring.
+
+    The FULL structured report is written to disk (path returned as
+    `report_path`); this tool returns a compact summary — counts, the
+    high-priority banners/images, and any extraction warnings — to keep the
+    agent's context small. Read `report_path` for the complete evidence.
+    """
+    _check_auth(auth_token)
+    return await asyncio.to_thread(
+        extract_page_summary, url,
+        use_wordpress=use_wordpress,
+        capture_screenshots=capture_screenshots,
+        run_ocr=run_ocr,
+    )
+
+
+@mcp.tool()
 async def screenshot(url: str, selector: str | None = None, full_page: bool = True,
                      auth_token: str | None = None) -> dict:
     """Capture a base64-encoded PNG of a page (or a specific CSS selector)."""
@@ -75,10 +112,23 @@ async def evidence(url: str, excerpts: list[str], auth_token: str | None = None)
 
 
 @mcp.tool()
-def spell(text: str, auth_token: str | None = None) -> dict:
-    """Run a UK English spelling/grammar check and return structured issues."""
+def spell(text: str | None = None, extraction_id: str | None = None,
+          auth_token: str | None = None) -> dict:
+    """Run a UK English spelling/grammar check and return structured issues.
+
+    Pass `extraction_id` (from the `extract` tool) and the page text is resolved
+    server-side — no need to copy the page text into this call. `text` is still
+    accepted for direct use / backwards compatibility.
+    """
     _check_auth(auth_token)
-    return check_spelling(text)
+    if not text and extraction_id:
+        cached = get_cached_extraction(extraction_id)
+        if cached is None:
+            raise ValueError(
+                f"Unknown extraction_id '{extraction_id}'. Re-run `extract` first."
+            )
+        text = cached.get("page_text", "")
+    return check_spelling(text or "")
 
 
 @mcp.tool()
@@ -106,16 +156,67 @@ def template(document_path: str | None = None, text: str | None = None,
 
 
 @mcp.tool()
-def compliance(page_text: str, headings: list, rules: list,
-               price_candidates: list[str] | None = None,
-               auth_token: str | None = None) -> dict:
-    """Audit page text + headings against a list of QA template rules."""
+async def spec_lookup(course_name: str, qualification_number: str = "",
+                      level: str = "", awarding_body: str = "",
+                      auth_token: str | None = None) -> dict:
+    """Find the official Qualification Specification for a course via web search.
+
+    Pass the course name plus any of `qualification_number`, `level`,
+    `awarding_body` taken from the page. Searches the web (keyless), fetches the
+    most relevant awarding-body / Ofqual pages, and returns structured spec
+    parameters: `{found, specification:{level, qualification_number,
+    accreditation_status, credit_equivalency, glh, tqt, awarding_body, ...},
+    source_urls}`. Pass the whole returned object to `compliance` as
+    `specification` so the needs_spec rules are checked against it. On failure
+    it returns `found: false` — then the needs_spec rules are flagged for manual
+    verification rather than guessed.
+    """
     _check_auth(auth_token)
+    return await asyncio.to_thread(
+        lookup_specification, course_name,
+        qualification_number=qualification_number,
+        level=level,
+        awarding_body=awarding_body,
+    )
+
+
+@mcp.tool()
+def compliance(rules: list, extraction_id: str | None = None,
+               page_text: str | None = None, headings: list | None = None,
+               price_candidates: list[str] | None = None,
+               banner_evidence: list | None = None,
+               image_evidence: list | None = None,
+               specification: dict | None = None,
+               auth_token: str | None = None) -> dict:
+    """Audit page text, headings, banners and images against QA template rules.
+
+    Preferred usage: pass `rules` (from the `template` tool) and `extraction_id`
+    (from the `extract` tool). The page text, headings, price candidates and the
+    high-priority banner/image evidence are then resolved server-side, so claims
+    that live in banners or are baked into images (via OCR) are compared against
+    the rules too — without the agent having to copy any large blobs into this
+    call. The explicit parameters remain available for direct use.
+    """
+    _check_auth(auth_token)
+    if extraction_id:
+        cached = get_cached_extraction(extraction_id)
+        if cached is None:
+            raise ValueError(
+                f"Unknown extraction_id '{extraction_id}'. Re-run `extract` first."
+            )
+        page_text = page_text if page_text is not None else cached.get("page_text", "")
+        headings = headings if headings is not None else cached.get("headings", [])
+        price_candidates = price_candidates if price_candidates is not None else cached.get("price_candidates", [])
+        banner_evidence = banner_evidence if banner_evidence is not None else cached.get("banner_evidence", [])
+        image_evidence = image_evidence if image_evidence is not None else cached.get("image_evidence", [])
     return check_compliance(
-        page_text=page_text,
-        headings=headings,
+        page_text=page_text or "",
+        headings=headings or [],
         rules=rules,
         price_candidates=price_candidates,
+        banner_evidence=banner_evidence,
+        image_evidence=image_evidence,
+        specification=specification,
     )
 
 

@@ -21,7 +21,7 @@ def build_model() -> OpenAIModel:
                 "X-Title": "Strands QA Agent",
             },
         },
-        model_id=os.environ.get("MODEL", "deepseek/deepseek-v3.2"),
+        model_id=os.environ.get("MODEL", "deepseek/deepseek-v4-pro"),
         params={
             "temperature": 0.2,
             "extra_body": {"provider": openrouter_provider_block()},

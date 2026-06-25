@@ -178,6 +178,10 @@ _TRANSIENT_ERROR_MARKERS = (
     "connection reset",
     "incomplete response",
     "stream error",
+    "idle timeout",
+    "upstream",
+    "timed out",
+    "timeout exceeded",
     "503",
     "502",
     "504",
@@ -227,35 +231,73 @@ Strict rules — these exist because every LLM call costs money:
   * Call each tool AT MOST ONCE per run. If a tool returns an error, do NOT
     retry it with the same arguments. Record the failure in the JSON and move on.
   * Use exactly this fixed order — skip a step if its inputs are missing:
-      1. `scrape(url)` — note: the returned `text` is truncated to the first
-         ~8 KB of body text (see `text_truncated` / `text_total_chars`). Use
-         that capped slice for spell + compliance; do NOT try to fetch more.
+      1. `extract(url)` — the primary extraction stage. It renders the page in a
+         browser and returns a SMALL summary: `extraction_id`, `stats`,
+         `general_content`, `price_candidates`, trimmed `high_priority_banners`
+         / `high_priority_images` previews, `extraction_warnings`, and a
+         `report_path` (the FULL evidence report — banners, every image, OCR
+         text, claims, screenshots — written to disk). The full page text and
+         evidence are cached server-side under `extraction_id`. CRITICAL: do
+         NOT copy page text, banner evidence or image evidence into later tool
+         calls — just pass the small `extraction_id`. Do NOT read `report_path`.
       2. `template(...)`        — only if a template was provided. The
          template may be inline `text`, OR a `document_path` to an image,
          PDF, or Word `.docx` (whichever the user supplied — pass the path
          through verbatim, don't try to read or parse the file yourself).
-      3. `spell(text)`          — pass the scraped (capped) page text
-      4. `compliance(...)`      — only if step 2 returned rules. If the
-         scrape tool returned `price_candidates`, pass them to help the
-         model identify pricing sections.
-      5. `evidence(url, [...])` — pass the list of `excerpt` strings collected
-                                  from the spell + compliance issues. This
-                                  returns `{"shots": {excerpt: token}}` where
-                                  each token is a SHORT opaque string of the
-                                  form `evidence://<hash>`. Copy the token
-                                  verbatim into the corresponding issue's
-                                  `screenshot` field. NEVER inline base64
-                                  image data in your output — only the token.
+      3. `spell(extraction_id)` — pass the `extraction_id` from step 1 (the
+         server resolves the page text). Do NOT paste the page text here.
+      4. `spec_lookup(course_name, ...)` — ONLY if step 2 returned at least one
+         rule with `needs_spec: true`. Pass the course name EXACTLY as shown
+         (from step 1's page_title / h1, keeping words like "Extended" — an
+         "Extended Diploma" is a different qualification from a plain "Diploma"),
+         and ALWAYS pass the `qualification_number` (e.g. 610/1675/5), `level`
+         and `awarding_body` whenever they appear on the page (look in the
+         Course Highlights / header). The qualification number is what pins down
+         the correct spec variant, so never omit it if it is on the page. It
+         web-searches for the official Qualification Specification and returns a
+         `{found, specification, source_urls}` object. Keep that object to pass
+         into the next step. Copy its `source_urls` into the report's
+         `specification_source` field so the reviewer can see exactly which
+         specification document you checked against. Skip this step entirely if
+         no rule needs a spec.
+      5. `compliance(rules, extraction_id, specification)` — only if step 2
+         returned rules. Pass the `rules` from step 2, the `extraction_id` from
+         step 1, and (if you ran step 4) the whole object it returned as
+         `specification`. The server resolves the page text, headings, price
+         candidates and the high-priority banner/image evidence, so claims that
+         live in banners or are baked into images (price, discount,
+         accreditation, awarding body, guarantee, rating, urgency, etc.) are
+         compared against the rules too, not just the body text. needs_spec
+         rules are checked against `specification`; if it's missing or
+         `found:false`, those items are SILENTLY SKIPPED — do NOT emit a
+         "verify manually" / "check against the specification" issue. Verifying
+         the page is your job, never the reader's. Do NOT paste any evidence or
+         page text here.
+      6. `evidence(url, [...])` — collect proof for EVERY issue. Pass ONE list
+                                  containing the `excerpt` of every spell AND
+                                  compliance issue (so each issue gets its own
+                                  screenshot). The tool returns
+                                  `{"shots": {excerpt: token}}` where each token
+                                  is a SHORT opaque string of the form
+                                  `evidence://<hash>`. Copy the token verbatim
+                                  into the corresponding issue's `screenshot`
+                                  field. An excerpt may be omitted from `shots`
+                                  if no matching section was found on the page —
+                                  in that case leave that issue's `screenshot`
+                                  off. NEVER inline base64 image data — only the
+                                  token.
         DO NOT call `screenshot` (the full-page tool) — it is wasteful here.
-      6. `reason(instructions, issues, page_summary)` — ALWAYS call last.
+        DO NOT call `scrape` — `extract` (step 1) supersedes it; the page text,
+        headings and price candidates it produces are cached server-side.
+      7. `reason(instructions, issues, page_summary)` — ALWAYS call last.
          Pass the original user instructions verbatim, the issues array
          exactly as you will emit it (same order, same fields except you may
          drop `screenshot` to keep the payload small), and a small
-         `page_summary` dict containing `title`, `url`, the `headings` list
-         from scrape, and `template_summary` if any. Put the returned object
-         into the report under the top-level `reasoning` field — do NOT
-         alter or summarise it.
-  * After step 6 (or earlier if scrape failed), output ONE JSON object and STOP.
+         `page_summary` dict containing `title` and `h1` (from step 1's
+         `general_content`), `url`, and `template_summary` if any. Put the
+         returned object into the report under the top-level `reasoning` field
+         — do NOT alter or summarise it.
+  * After step 7 (or earlier if extract failed), output ONE JSON object and STOP.
     Do not write any prose before or after the JSON.
 
 JSON schema:
@@ -263,6 +305,7 @@ JSON schema:
     "course_name": "<page title or 'QA run incomplete'>",
     "url": "<the input url>",
     "template_summary": "<from template tool, or null>",
+    "specification_source": "<spec_lookup source_urls (the official spec document you checked), or null>",
     "issues": [
       {
         "type": "Spelling|Grammar|Punctuation|Style|Template",

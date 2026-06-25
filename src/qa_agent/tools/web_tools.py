@@ -107,12 +107,22 @@ _HIDE_OVERLAYS_JS = r"""
     // Skip body/html (WordPress sets position:fixed on body to lock scroll for
     // popups — hiding body would nuke all content), and skip elements with
     // substantial text content (those are real article-level wrappers).
+    //
+    // IMPORTANT: a sticky *price block* (price + "Buy Now"/"Enquire Now" +
+    // money-back guarantee + Trustpilot) is real QA content, not an overlay —
+    // but it's short and fixed, so the naive rule would hide it and every
+    // price-related evidence screenshot would come back blank. Protect any
+    // sticky element whose class/id/text marks it as pricing or a purchase CTA.
+    const PROTECT_STICKY = /price|pricing|cart|checkout|buy[\s-]?now|enquir|enrol|enroll|purchase|add[\s-]?to[\s-]?cart|guarantee/i;
     document.querySelectorAll('*').forEach(el => {
         if (el === document.body || el === document.documentElement) return;
         const cs = getComputedStyle(el);
         if (cs.position !== 'fixed' && cs.position !== 'sticky') return;
         const textLen = (el.innerText || '').trim().length;
         if (textLen >= 800) return;  // probably real content, not an overlay
+        const sig = ((el.className && el.className.toString) ? el.className.toString() : '')
+            + ' ' + (el.id || '') + ' ' + (el.innerText || '');
+        if (PROTECT_STICKY.test(sig)) return;  // keep price / purchase CTAs visible
         el.style.setProperty('display', 'none', 'important');
     });
 }
@@ -243,21 +253,115 @@ def take_screenshot(url: str, selector: str | None = None, full_page: bool = Tru
 # excerpt, scroll it into view, and clip a focused screenshot with padding.
 # ---------------------------------------------------------------------------
 
-# Walk up from the matched node until the bounding rect is a sensible block
-# (avoids screenshotting a 1×1 inline span). Returns the parent ElementHandle
-# so we can let Playwright do the scrolling + clipping natively.
+# Walk up from the matched node to the smallest *block-level* element that
+# contains the offending text — a paragraph, list item, heading, table cell or
+# the like — so the evidence screenshot shows just the part with the issue, not
+# the whole surrounding section. We deliberately do NOT climb to section / card
+# / row containers: the reviewer asked for the specific line, not the page.
+# A hard height cap keeps a stray full-height wrapper from swallowing the page.
 _WALK_UP_JS = r"""
 (el) => {
+    const vh = window.innerHeight || 900;
+    const maxH = vh * 0.8;   // never return more than ~one screenful
+    const BLOCK = new Set(['p','li','h1','h2','h3','h4','h5','h6','td','th',
+        'dd','dt','figcaption','blockquote','label','a','button','span','div']);
+    const isBlock = (n) => {
+        if (!n || !n.tagName) return false;
+        const disp = getComputedStyle(n).display;
+        return disp === 'block' || disp === 'list-item' || disp === 'table-cell'
+            || disp === 'flex' || disp === 'grid'
+            || BLOCK.has(n.tagName.toLowerCase());
+    };
+    // Climb out of tiny inline wrappers until we reach a block that is big
+    // enough to read but still no taller than the cap. Stop at the FIRST such
+    // block — don't keep climbing into the enclosing section.
     let target = el;
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6 && target.parentElement; i++) {
         const r = target.getBoundingClientRect();
-        if (r.height >= 28 && r.width >= 100) break;
-        if (!target.parentElement) break;
+        if (isBlock(target) && r.height >= 18 && r.width >= 80 && r.height <= maxH) {
+            break;
+        }
+        // If this node already overflows the cap, the previous (smaller) one was
+        // the best focused choice — but we only reach here when it wasn't a
+        // usable block yet, so step up once more and re-test.
         target = target.parentElement;
+    }
+    // Safety net: if we still ended up with something taller than the cap,
+    // prefer the originally matched (smaller) element over the oversized block.
+    if (target.getBoundingClientRect().height > maxH) {
+        return el;
     }
     return target;
 }
 """
+
+# Stop-words stripped when deriving section keywords from an excerpt/description.
+_STOPWORDS = frozenset(
+    "the a an of to and or for is are be on in at with this that section page "
+    "must should not no missing present above below text course your you will".split()
+)
+
+
+def _section_keywords(text: str) -> list[str]:
+    """Pull the few most distinctive words from an excerpt/description.
+
+    Used to locate a section by its heading when the excerpt itself isn't
+    present verbatim on the page (e.g. a compliance issue that says a section
+    is missing or mis-titled). Returns [] when nothing distinctive remains.
+    """
+    words = re.findall(r"[A-Za-z][A-Za-z'&-]{2,}", text or "")
+    keep: list[str] = []
+    seen: set[str] = set()
+    for w in words:
+        low = w.lower()
+        if low in _STOPWORDS or low in seen:
+            continue
+        seen.add(low)
+        keep.append(w)
+        if len(keep) >= 6:
+            break
+    return keep
+
+
+def _capture_section_by_keywords(page: Page, text: str) -> str | None:
+    """Fallback: screenshot the page section whose heading matches `text`.
+
+    Looks for an h1–h4 containing the excerpt's distinctive keywords, then
+    screenshots that heading's enclosing section. Returns base64 PNG or None.
+    """
+    keywords = _section_keywords(text)
+    if not keywords:
+        return None
+    try:
+        headings = page.query_selector_all("h1, h2, h3, h4")
+    except Exception:
+        return None
+    best = None
+    best_score = 0
+    for h in headings:
+        try:
+            if not h.is_visible(timeout=150):
+                continue
+            htext = (h.inner_text() or "").lower()
+        except Exception:
+            continue
+        score = sum(1 for kw in keywords if kw.lower() in htext)
+        if score > best_score:
+            best_score = score
+            best = h
+    if best is None or best_score == 0:
+        return None
+    try:
+        js_handle = best.evaluate_handle(_WALK_UP_JS)
+        block = js_handle.as_element() or best
+        block.scroll_into_view_if_needed(timeout=3000)
+        buf = block.screenshot(timeout=5000)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("evidence: section fallback failed for %r: %s", text[:40], exc)
+        return None
+    if _is_blank_png(buf):
+        return None
+    return base64.b64encode(buf).decode()
 
 
 # LLMs sometimes annotate excerpts with the element type — "H1: ...", "Heading: ...",
@@ -346,8 +450,13 @@ def _capture_excerpt(page: Page, excerpt: str) -> str | None:
             logger.debug("evidence: snippet %r missed (%s)", snippet[:40], type(exc).__name__)
             continue
     if handle is None:
-        logger.info("evidence: no element found for %r", text[:60])
-        return None
+        # The excerpt isn't on the page verbatim (e.g. a structural / "missing
+        # section" finding). Fall back to screenshotting the section whose
+        # heading best matches the excerpt's keywords; skip if none matches.
+        section_shot = _capture_section_by_keywords(page, text)
+        if section_shot is None:
+            logger.info("evidence: no element or section found for %r", text[:60])
+        return section_shot
     logger.debug("evidence: matched %r via %r", text[:60], matched_with)
 
     # Walk up to a sensible block-level ancestor so the screenshot has context.
@@ -450,3 +559,43 @@ def capture_excerpts(url: str, excerpts: list[str]) -> dict[str, str]:
         finally:
             browser.close()
     return out
+
+
+def attach_issue_screenshots(report: dict) -> dict:
+    """Deterministically attach a cropped screenshot to every issue that has one.
+
+    The agent is supposed to call the `evidence` tool and copy tokens onto each
+    issue, but that depends on the model remembering to do it — and when it
+    forgets, the report comes back with no screenshots at all (which the sample
+    QA docs always include). This runs the capture ourselves, from the issues'
+    own excerpts, so a screenshot is attached whenever the excerpt can be located
+    on the page. Issues that already carry a screenshot, or whose excerpt can't
+    be found, are left as-is. Best-effort: any failure leaves the report intact.
+
+    Returns the same report (mutated in place) for convenience.
+    """
+    url = report.get("url")
+    issues = report.get("issues") or []
+    if not url or not issues:
+        return report
+    wanted = [
+        (issue.get("excerpt") or "").strip()
+        for issue in issues
+        if isinstance(issue, dict) and not issue.get("screenshot")
+        and (issue.get("excerpt") or "").strip()
+    ]
+    if not wanted:
+        return report
+    try:
+        shots = capture_excerpts(url, wanted)  # {excerpt: evidence_token}
+    except Exception as exc:  # noqa: BLE001 - evidence is best-effort
+        logger.info("deterministic screenshot capture failed: %s", exc)
+        return report
+    for issue in issues:
+        if not isinstance(issue, dict) or issue.get("screenshot"):
+            continue
+        excerpt = (issue.get("excerpt") or "").strip()
+        token = shots.get(excerpt)
+        if token:
+            issue["screenshot"] = token
+    return report

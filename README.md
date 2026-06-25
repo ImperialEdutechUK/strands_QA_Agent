@@ -98,8 +98,9 @@ Outputs land in `reports/qa-report-<timestamp>.json` and `.pdf`.
 
 ## How it works
 
-1. The **MCP server** (`mcp_server.py`) exposes five tools — `scrape`, `screenshot`,
-   `spell`, `template`, `compliance` — over MCP streamable-HTTP.
+1. The **MCP server** (`mcp_server.py`) exposes the QA tools — `scrape`,
+   `extract`, `screenshot`, `evidence`, `spell`, `template`, `compliance`,
+   `reason` — over MCP streamable-HTTP.
 2. The **Strands Agent** (`agent.py`) connects via `MCPClient`, lists those tools,
    and is steered by a system prompt that prescribes the QA flow.
 3. The **OpenRouter** model provider (`llm.py`) wraps Strands' `OpenAIModel` with
@@ -107,12 +108,57 @@ Outputs land in `reports/qa-report-<timestamp>.json` and `.pdf`.
 4. The **CLI** (`main.py`) writes both a JSON report and a PDF (`report_tool.py`,
    ReportLab) into `reports/`.
 
+## Layered evidence extraction
+
+For QA comparisons that need detailed, image-aware evidence (banners, hero
+sections, promotional graphics, accreditation/trust badges, course thumbnails,
+CTA blocks, and image-based claims), use the dedicated extraction stage in
+[`extraction.py`](src/qa_agent/extraction.py). It is **deterministic** (no LLM),
+so the evidence is faithful and reproducible, and it is exposed both as an MCP
+tool (`extract`) and a standalone CLI:
+
+```bash
+python -m qa_agent.extraction --url https://example.com/your-course
+# options: --no-wordpress  --no-screenshots  --no-ocr  --out report.json
+```
+
+It runs a layered pipeline:
+
+1. **WordPress REST API** (`/wp-json/wp/v2/pages|posts?slug=…&_embed=1`) for
+   structured page + media metadata (title, slug, content, featured media, alt
+   text, captions, modified date) when the site exposes it.
+2. **Rendered DOM** via Playwright with lazy-load auto-scroll, so JS-rendered
+   text, sliders, banners, accordions, tabs and page-builder sections are seen.
+3. **Image discovery** beyond `<img>` — `<picture>`/`<source srcset>`, `srcset`,
+   lazy `data-*` attributes, computed CSS `background-image`, inline styles, and
+   Elementor/Divi/WPBakery/Fusion/Bricks page-builder backgrounds.
+4. **Carousel slides** read straight from the DOM (every slide, not just the
+   first visible one), marked `is_carousel` + `slide_index`.
+5. **Element screenshots** as evidence for banners and QA-relevant images.
+6. **OCR** (Tesseract) of text baked into banner/promo images, with a confidence
+   flag (gracefully skipped if Tesseract isn't installed).
+7. **Claim detection** (price, discount, duration, certification, accreditation,
+   awarding body, eligibility, guarantee, rating, urgency, learner numbers) and
+   **QA-priority** scoring (high/medium/low) per the agreed rules.
+
+The full structured report (`page_url`, `general_content`, `banners`, `images`,
+`extraction_warnings`, plus `wordpress`/`stats`) is written under
+`reports/extraction/`; element screenshots land alongside it. The MCP `extract`
+tool persists the same full report to disk and returns only a compact summary
+(counts + high-priority items + the report path) to keep the agent's LLM context
+small. Set `QA_EXTRACTION_DIR` to change the output location and
+`QA_EXTRACTION_MAX_OCR` to bound OCR cost.
+
 ## Execution model
 
 The CLI runs a single execution path: the **Strands agent** orchestrates the
-MCP tools (`scrape`, `template`, `spell`, `compliance`, `evidence`) under a
-strict system prompt that calls each tool at most once and emits one JSON
-object at the end. The CLI parses that JSON, persists it, and renders the PDF.
+MCP tools (`extract`, `template`, `spell`, `compliance`, `evidence`, `reason`)
+under a strict system prompt that calls each tool at most once and emits one
+JSON object at the end. `extract` is the layered evidence stage and runs first
+automatically; its high-priority banner/image claims (including OCR text) are
+passed into `compliance`, so claims baked into banners or images are checked
+against the template rules alongside the body text. The CLI parses the JSON,
+persists it, and renders the PDF.
 
 ## Security
 

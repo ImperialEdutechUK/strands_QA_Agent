@@ -1,8 +1,11 @@
 """CLI entry point.
 
 Runs the **Strands agent** end-to-end: the LLM orchestrates the QA tools
-exposed by the MCP server (scrape -> template -> spell -> compliance ->
-evidence) and returns a single JSON report which is then rendered to PDF.
+exposed by the MCP server (extract -> template -> spell -> compliance ->
+evidence -> reason) and returns a single JSON report which is then rendered
+to PDF. `extract` is the layered evidence stage (page text + banners + images
++ OCR + claims); its banner/image claims are compared against template rules
+in the compliance step.
 """
 
 from __future__ import annotations
@@ -19,7 +22,11 @@ from dotenv import load_dotenv
 from .logging_config import configure_logging
 from .security import redact
 from .tools.report_tool import generate_pdf
-from .tools.web_tools import EVIDENCE_TOKEN_PREFIX, read_evidence_png
+from .tools.web_tools import (
+    EVIDENCE_TOKEN_PREFIX,
+    attach_issue_screenshots,
+    read_evidence_png,
+)
 
 load_dotenv()
 configure_logging()
@@ -37,6 +44,8 @@ def main(url: str, template_path: str | None, template_text: str | None, out: st
         template_path=template_path,
         template_text=template_text,
     )
+    report.setdefault("url", url)
+    attach_issue_screenshots(report)
     _resolve_evidence_tokens(report)
 
     reports_dir = Path("reports")
