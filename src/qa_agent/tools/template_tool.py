@@ -100,7 +100,7 @@ Output ONLY the JSON object."""
 BASELINE_RULES: list[dict] = [
     # ---- Step 01 — General Information (spec match) --------------------------
     {"id": "S01-1", "category": "Content", "severity": "Critical", "needs_spec": True,
-     "rule": "Step 01 General Information: the Course Name must match the official Qualification / Centre Specification exactly."},
+     "rule": "Step 01 General Information: the Course Name must match the official Qualification / Centre Specification on the qualification itself — same level, same qualification type, same subject, and the same 'Extended'/non-'Extended' form. IGNORE a leading awarding-body / provider name (e.g. 'Qualifi', 'Pearson', 'TQUK', 'OTHM', 'NCFE', 'Highfield'): the page title is NOT required to include the awarding body's name, so a spec named 'Qualifi Level 5 Extended Diploma in Information Technology' matching a page title 'Level 5 Extended Diploma in Information Technology' is CORRECT — do NOT flag the missing provider name, and do not flag a differing RQF/RofQ bracket suffix. Only flag a genuine difference in level, qualification type, or subject."},
     {"id": "S01-2", "category": "Content", "severity": "Critical", "needs_spec": True,
      "rule": "Step 01 General Information: the Level (e.g. Level 4, Level 5) must match the specification."},
     {"id": "S01-3", "category": "Content", "severity": "Critical", "needs_spec": True,
@@ -148,7 +148,7 @@ BASELINE_RULES: list[dict] = [
     {"id": "S04-8", "category": "Structure", "severity": "Minor", "needs_spec": False,
      "rule": "Step 04 SLC only: the two boxes (blue and yellow) following the content are present."},
     {"id": "S04-9", "category": "Content", "severity": "Minor", "needs_spec": False,
-     "rule": "Step 04 Average Completion Timeframe matches the course type — Award: 2–4 months; Certificate: 4–6 months; Diploma: 6–9 months; Extended Diploma: 9–12 months (adjusted where fast-track information has been received)."},
+     "rule": "Step 04 Average Completion Timeframe matches the course type — Award: 2–4 months; Certificate: 4–6 months; Diploma: 6–9 months; Extended Diploma: 9–12 months. These bands describe the STANDARD completion timeframe. A fast-track / accelerated / shorter plan is EXPECTED to be below the standard band — a fast-track duration that is shorter than the band is correct, NOT an issue, so never flag it. Only flag a timeframe that is LONGER than the course type's upper bound (e.g. a Diploma showing more than 9 months, or a fast-track plan longer than the standard plan), or a standard (non-fast-track) timeframe that sits outside its band."},
     {"id": "S04-10", "category": "Content", "severity": "Minor", "needs_spec": False,
      "rule": "Step 04 Method of Assessment: assignment-based courses clearly state that no exams are involved."},
     {"id": "S04-11", "category": "Structure", "severity": "Minor", "needs_spec": False,

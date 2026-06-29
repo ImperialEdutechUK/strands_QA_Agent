@@ -127,6 +127,13 @@ def _run_agent_sync(url: str, template_path: str | None, template_text: str | No
             "raw_agent_output": text,
         }
 
+    # The agent self-review is kept for our logs only — strip it from the report
+    # so it never reaches the UI / PDF / JSON artefact. (The `reason` tool still
+    # runs; we just don't surface its verdict to the reviewer.)
+    reasoning = report.pop("reasoning", None)
+    if reasoning:
+        logger.info("agent self-review (logs only): %s", json.dumps(reasoning, ensure_ascii=False))
+
     # Make sure the page URL is set so screenshot capture (below) has a target,
     # then attach a cropped screenshot to every issue from its excerpt. Done in
     # this worker thread because Playwright cannot run in the async event loop.

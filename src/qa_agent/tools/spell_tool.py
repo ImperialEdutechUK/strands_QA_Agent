@@ -1,6 +1,7 @@
 import re
 
 from ..llm_client import call_llm_json
+from .web_tools import _truncate_head_at_word
 
 SYSTEM = (
     "You are a meticulous UK English copy editor reviewing course web page content. "
@@ -36,6 +37,12 @@ SYSTEM = (
     "    headings, badge text, course codes, or short UI strings.\n"
     "  * When in doubt about whether something is a real authored error or a "
     "    layout artifact, DO NOT emit it.\n"
+    "  * The text may be TRUNCATED for length — you may see a marker like "
+    "    '... [content truncated; tail preserved] ...', or the text may simply "
+    "    stop. A word or sentence cut off at the very start or end of the text, "
+    "    or right next to a truncation marker (e.g. a trailing 'qualifications d' "
+    "    where the next word was clipped), is an extraction artifact — NEVER flag "
+    "    it as an incomplete sentence, a cut-off / mid-word error, or a typo.\n"
     "  * If the text is already correct UK English, return {\"issues\": []}."
 )
 
@@ -85,7 +92,7 @@ def _is_real_spell_issue(issue: dict) -> bool:
 
 
 def check_spelling(text: str) -> dict:
-    trimmed = (text or "")[:12000]
+    trimmed = _truncate_head_at_word(text or "", 12000)
     prompt = f'{SCHEMA_INSTRUCTION}\n\nTEXT TO REVIEW:\n"""{trimmed}"""'
     result = call_llm_json(prompt, system=SYSTEM)
     issues = result.get("issues") or []

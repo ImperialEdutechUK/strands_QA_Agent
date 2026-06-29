@@ -45,7 +45,13 @@ from .security import (
     UnsafeURLError,
     validate_public_url,
 )
-from .tools.web_tools import USER_AGENT, _cap_text, _new_browser_page
+from .tools.web_tools import (
+    USER_AGENT,
+    _EXPAND_SECTIONS_JS,
+    _cap_text,
+    _new_browser_page,
+    _truncate_head_at_word,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -567,6 +573,175 @@ _EXTRACT_JS = Path(__file__).with_name("_extract_dom.js").read_text(encoding="ut
     if (Path(__file__).with_name("_extract_dom.js")).exists() else None
 
 
+# ---------------------------------------------------------------------------
+# Per-click FAQ / accordion capture (single-open accordions)
+# ---------------------------------------------------------------------------
+# Some FAQ / course-content accordions only allow ONE panel open at a time:
+# opening the next question auto-closes the previous one. A single end-of-page
+# innerText snapshot (what `_EXTRACT_JS` reads) therefore only ever sees the
+# last-opened answer. To QA every answer against its own question heading and
+# the course details, we click each toggle in turn and read its panel right
+# after it opens — capturing the question + answer pair before the next click
+# collapses it again. Read-only: we open panels and read text, nothing else.
+MAX_FAQ_ITEMS = int(os.environ.get("QA_MAX_FAQ_ITEMS", "60"))
+FAQ_CLICK_WAIT_MS = int(os.environ.get("QA_FAQ_CLICK_WAIT_MS", "250"))
+
+_FAQ_TOGGLE_SELECTOR = ", ".join([
+    "details > summary",
+    "[class*='accordion' i] [class*='title' i]",
+    "[class*='accordion' i] [class*='head' i]",
+    "[class*='accordion' i] button",
+    "[class*='faq' i] [class*='question' i]",
+    "[class*='faq' i] [class*='title' i]",
+    "[class*='faq' i] [class*='head' i]",
+    "[class*='toggle' i] [class*='title' i]",
+    ".elementor-tab-title",
+    ".et_pb_toggle_title",
+    "[data-toggle='collapse']",
+    "[data-bs-toggle='collapse']",
+])
+
+# Resolve a toggle's answer panel and return its text, with the question text
+# (which some containers repeat) trimmed off the front.
+_READ_FAQ_PANEL_JS = r"""
+(tog) => {
+    const clean = (s) => ("" + (s || "")).replace(/\s+/g, " ").trim();
+    let panel = null;
+    const ac = tog.getAttribute("aria-controls");
+    if (ac) { try { panel = document.getElementById(ac); } catch (e) {} }
+    if (!panel) {
+        const dt = tog.getAttribute("data-bs-target")
+            || tog.getAttribute("data-target")
+            || (tog.getAttribute("href") || "");
+        if (dt && dt.charAt(0) === "#" && dt.length > 1) {
+            try { panel = document.querySelector(dt); } catch (e) {}
+        }
+    }
+    if (!panel && tog.tagName === "SUMMARY") panel = tog.parentElement;  // <details>
+    if (!panel) {
+        panel = tog.closest(
+            "[class*='accordion-item' i], .elementor-accordion-item, "
+            + ".et_pb_toggle, [class*='faq' i] [class*='item' i], li"
+        );
+    }
+    if (!panel) {
+        // Skip <style>/<script>/<noscript> siblings whose text is CSS/JS, not an answer.
+        let sib = tog.nextElementSibling;
+        while (sib && /^(STYLE|SCRIPT|NOSCRIPT)$/.test(sib.tagName)) sib = sib.nextElementSibling;
+        panel = sib;
+    }
+    if (!panel) return "";
+    if (/^(STYLE|SCRIPT|NOSCRIPT)$/.test(panel.tagName)) return "";
+    let text = clean(panel.innerText);
+    const q = clean(tog.innerText);
+    if (q && text.toLowerCase().startsWith(q.toLowerCase())) {
+        text = clean(text.slice(q.length));
+    }
+    return text;
+}
+"""
+
+
+# Some panels embed a <style>/<script> block whose CSS/JS text can leak into
+# innerText (e.g. a raw `#accordion { ... }` rule). That is not an answer — drop it.
+_CODE_NOISE_RE = re.compile(
+    r"[#.][\w-]+\s*\{|font-family\s*:|@media\b|!important|function\s*\(|;\s*\}",
+    re.I,
+)
+
+
+def _looks_like_code(text: str) -> bool:
+    return "{" in text and "}" in text and bool(_CODE_NOISE_RE.search(text))
+
+
+def _capture_faq_items(page: Page) -> list[dict]:
+    """Click each FAQ/accordion toggle one at a time and read its answer.
+
+    Returns a list of ``{"question", "answer"}`` pairs. Best-effort: any toggle
+    that can't be clicked or read is skipped. Real navigation links are skipped
+    so a toggle that is actually an ``<a href>`` can't take us off-page.
+    """
+    items: list[dict] = []
+    try:
+        toggles = page.query_selector_all(_FAQ_TOGGLE_SELECTOR)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("FAQ toggle query failed: %s", exc)
+        return items
+
+    seen_q: set[str] = set()
+    for tog in toggles:
+        if len(items) >= MAX_FAQ_ITEMS:
+            break
+        try:
+            question = _clean(tog.inner_text())
+        except Exception:  # noqa: BLE001 - stale/detached handle
+            continue
+        if not question or len(question) > 300:
+            continue
+        qkey = question.lower()
+        if qkey in seen_q:
+            continue
+
+        # Never follow a real navigation link.
+        try:
+            if tog.evaluate("e => e.tagName") == "A":
+                href = tog.get_attribute("href") or ""
+                if href and not href.startswith("#") and not href.startswith("javascript:"):
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Open it if it isn't already (single-open accordions report state via
+        # aria-expanded; if absent we just click and let the panel render).
+        try:
+            expanded = tog.get_attribute("aria-expanded")
+        except Exception:  # noqa: BLE001
+            expanded = None
+        if expanded != "true":
+            try:
+                tog.scroll_into_view_if_needed(timeout=1500)
+                tog.click(timeout=1500)
+                page.wait_for_timeout(FAQ_CLICK_WAIT_MS)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("FAQ click failed for %r: %s", question[:40], exc)
+                # Fall through — it may already be open; still try to read it.
+
+        try:
+            answer = _clean(tog.evaluate(_READ_FAQ_PANEL_JS))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("FAQ panel read failed for %r: %s", question[:40], exc)
+            continue
+        if not answer or answer.lower() == qkey or _looks_like_code(answer):
+            continue
+        seen_q.add(qkey)
+        items.append({"question": question[:300], "answer": answer[:1500]})
+
+    return items
+
+
+def _format_faq_block(faq_items: list[dict]) -> str:
+    """Render captured FAQ Q&A pairs as a labelled text block for QA checks.
+
+    Each answer is kept paired with its own question so the compliance check can
+    verify the answer aligns with its FAQ heading and the course content.
+    """
+    if not faq_items:
+        return ""
+    lines = ["FAQ SECTION (each answer captured under its own question):"]
+    budget = 6000
+    for item in faq_items:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        if not q or not a:
+            continue
+        entry = f"Q: {q}\nA: {a}"
+        if budget - len(entry) < 0:
+            break
+        budget -= len(entry)
+        lines.append(entry)
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def _navigate(page: Page, url: str) -> None:
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     try:
@@ -577,6 +752,14 @@ def _navigate(page: Page, url: str) -> None:
         page.evaluate(_AUTOSCROLL_JS)
     except Exception as exc:  # noqa: BLE001
         logger.debug("autoscroll best-effort failed: %s", exc)
+    # Expand collapsed FAQ accordions / toggles / <details> so each answer's
+    # text is rendered next to its heading and captured by the DOM extraction
+    # below — otherwise hidden answers can't be QA'd against their FAQ heading
+    # or the course content.
+    try:
+        page.evaluate(_EXPAND_SECTIONS_JS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("section expand best-effort failed: %s", exc)
     page.wait_for_timeout(SCROLL_SETTLE_MS)
 
 
@@ -665,6 +848,9 @@ def extract_page(
             banners = _process_banners(
                 page, raw.get("banners", []), shot_dir, ocr_ok, warnings
             )
+            # Per-click FAQ/accordion capture runs LAST so its clicking can't
+            # shift element positions for the image/banner screenshots above.
+            faq_items = _capture_faq_items(page)
         finally:
             browser.close()
 
@@ -675,6 +861,7 @@ def extract_page(
         "general_content": general,
         "banners": banners,
         "images": images,
+        "faq_items": faq_items,
         "extraction_warnings": _dedupe(warnings),
         "wordpress": wp,
         "stats": {
@@ -914,9 +1101,23 @@ def extract_page_summary(
     banner_evidence = [slim_banner(b) for b in report["banners"] if b["qa_priority"] == "high"]
     image_evidence = [slim_image(i) for i in report["images"] if i["qa_priority"] == "high"]
 
+    # Fold per-click-captured FAQ answers into the page text the spell/compliance
+    # checks read. Single-open accordions only ever leave their LAST answer in
+    # the snapshot text, so each Q&A is appended here as a labelled block. We keep
+    # body + FAQ within the compliance read window (~8000 chars) so the FAQ — the
+    # content we want aligned against its heading and the course details — is
+    # never sliced off the end downstream.
+    faq_items = report.get("faq_items") or []
+    faq_block = _format_faq_block(faq_items)
+    if faq_block:
+        head_room = max(1500, 8000 - len(faq_block) - 20)
+        page_text_for_checks = f"{_truncate_head_at_word(capped_text, head_room)}\n\n{faq_block}"
+    else:
+        page_text_for_checks = capped_text
+
     # Stash the heavy inputs server-side; the model only ever sees `extraction_id`.
     _cache_put(extraction_id, {
-        "page_text": capped_text,
+        "page_text": page_text_for_checks,
         "headings": gc.get("headings", []),
         "price_candidates": price_candidates,
         "banner_evidence": banner_evidence,
@@ -945,6 +1146,11 @@ def extract_page_summary(
         # does NOT need to copy these anywhere — compliance reads them by id.
         "high_priority_banners": banner_evidence[:8],
         "high_priority_images": image_evidence[:12],
+        # FAQ Q&A captured by clicking each (single-open) accordion in turn. The
+        # full text is already folded into the cached page_text the checks read;
+        # this preview lets the agent/UI see what was captured.
+        "faq_count": len(faq_items),
+        "faq_items": faq_items[:30],
         "extraction_warnings": report["extraction_warnings"],
     }
 

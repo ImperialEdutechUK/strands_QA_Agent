@@ -4,6 +4,7 @@ import json
 import re
 
 from ..llm_client import call_llm_json
+from .web_tools import _truncate_head_at_word
 
 SYSTEM = (
     "You audit a course web page against a list of QA template rules. "
@@ -257,7 +258,7 @@ def check_compliance(page_text: str, headings: list, rules: list,
         f"{_format_banner_evidence(banner_evidence)}\n\n"
         f"IMAGE EVIDENCE (logos, accreditation/trust badges, thumbnails, OCR text):\n"
         f"{_format_image_evidence(image_evidence)}\n\n"
-        f'PAGE TEXT (truncated):\n"""{(page_text or "")[:8000]}"""'
+        f'PAGE TEXT (truncated):\n"""{_truncate_head_at_word(page_text or "", 8000)}"""'
     )
     result = call_llm_json(prompt, system=SYSTEM)
     issues = result.get("issues") or []

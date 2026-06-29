@@ -4,11 +4,14 @@ import base64
 from io import BytesIO
 from pathlib import Path
 
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import (
+    HRFlowable,
     Image,
     Paragraph,
     SimpleDocTemplate,
@@ -69,6 +72,29 @@ def _format_spec_sources(spec_source) -> str:
     return ", ".join(links)
 
 
+def _link_html(url: str) -> str:
+    """Render a URL as a clickable blue link (or plain text if not http(s))."""
+    safe = _html_escape(url)
+    if str(url).lower().startswith(("http://", "https://")):
+        return f'<link href="{safe}"><font color="#2874a6">{safe}</font></link>'
+    return safe
+
+
+def _issue_lines(issue: dict) -> tuple[str, str]:
+    """Return (problem, change) for an issue block.
+
+    `problem` states what is wrong (the description, or the suggestion when there
+    is no description); `change` is the corrected text shown after "Change as:".
+    When the only text available is the suggestion it becomes the problem line and
+    there is no separate change line, so nothing is duplicated.
+    """
+    description = (issue.get("description") or "").strip()
+    suggestion = (issue.get("suggestion") or "").strip()
+    problem = description or suggestion or "Review this item."
+    change = suggestion if suggestion and suggestion.lower() != problem.lower() else ""
+    return problem, change
+
+
 def _instruction_text(issue: dict) -> str:
     """The actionable correction line, in the team's house style.
 
@@ -88,53 +114,101 @@ def _instruction_text(issue: dict) -> str:
 
 def generate_pdf(report: dict, out_path: str) -> str:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    styles = getSampleStyleSheet()
-    doc = SimpleDocTemplate(out_path, pagesize=A4, title=report.get("course_name", "QA Report"))
+    base = getSampleStyleSheet()
 
-    # House style: lead with Course Name / Course Link, then a numbered list of
-    # actionable correction instructions — matching the team's QA update docs.
-    flow: list = [
-        Paragraph(f"<b>Course Name:</b> {_html_escape(report.get('course_name', ''))}", styles["Normal"]),
-        Paragraph(f"<b>Course Link:</b> {_html_escape(report.get('url', ''))}", styles["Normal"]),
-    ]
+    # Presentation styles (layout only — no report data is altered here).
+    ink = colors.HexColor("#1f3a5f")
+    title_style = ParagraphStyle(
+        "QATitle", parent=base["Title"], alignment=TA_CENTER,
+        fontSize=24, leading=28, spaceAfter=2, textColor=ink,
+    )
+    course_style = ParagraphStyle(
+        "QACourse", parent=base["Normal"], alignment=TA_CENTER,
+        fontSize=13, leading=17, textColor=colors.HexColor("#444444"), spaceAfter=4,
+    )
+    meta_style = ParagraphStyle(
+        "QAMeta", parent=base["Normal"], fontSize=9.5, leading=14,
+        textColor=colors.HexColor("#555555"),
+    )
+    section_style = ParagraphStyle(
+        "QASection", parent=base["Heading2"], fontSize=15, leading=18,
+        spaceBefore=6, spaceAfter=2, textColor=ink,
+    )
+    issue_style = ParagraphStyle(
+        "QAIssue", parent=base["Normal"], fontSize=11, leading=15,
+    )
+    detail_style = ParagraphStyle(
+        "QADetail", parent=base["Normal"], fontSize=10, leading=14,
+        leftIndent=20, textColor=colors.HexColor("#333333"),
+    )
+
+    doc = SimpleDocTemplate(
+        out_path, pagesize=A4, title=report.get("course_name", "QA Report"),
+        topMargin=1.6 * cm, bottomMargin=1.6 * cm,
+    )
+
+    # ---- Header: centered title + course name -----------------------------
+    flow: list = [Paragraph("QA Report", title_style)]
+    course_name = _html_escape(report.get("course_name", ""))
+    if course_name:
+        flow.append(Paragraph(course_name, course_style))
+    flow.append(HRFlowable(width="100%", thickness=1.2, color=ink,
+                           spaceBefore=4, spaceAfter=10))
+
+    # ---- Links / meta ------------------------------------------------------
+    url = report.get("url", "")
+    if url:
+        flow.append(Paragraph(f"<b>Course Link:</b> {_link_html(url)}", meta_style))
     if report.get("template_summary"):
-        flow.append(Paragraph(f"<b>Qualification / Template:</b> {_html_escape(report['template_summary'])}", styles["Normal"]))
+        flow.append(Paragraph(
+            f"<b>Qualification / Template:</b> {_html_escape(report['template_summary'])}",
+            meta_style,
+        ))
     spec_src = _format_spec_sources(report.get("specification_source"))
     if spec_src:
-        flow.append(Paragraph(f"<b>Qualification Specification checked:</b> {spec_src}", styles["Normal"]))
-    flow.append(Paragraph(f"<i>Generated: {report.get('generated_at', '')}</i>", styles["Italic"]))
+        flow.append(Paragraph(f"<b>Qualification Specification checked:</b> {spec_src}", meta_style))
+    if report.get("generated_at"):
+        flow.append(Paragraph(f"<i>Generated: {_html_escape(report['generated_at'])}</i>", meta_style))
 
+    # ---- QA Issues section -------------------------------------------------
     issues = report.get("issues", []) or []
     counts = _count_severities(issues)
-    flow.append(Spacer(1, 0.3 * cm))
+    flow.append(Spacer(1, 0.5 * cm))
+    flow.append(Paragraph("QA Issues", section_style))
     flow.append(Paragraph(
         f"<b>QA updates required:</b> {len(issues)} &nbsp; "
         f"<font color='{SEVERITY_COLOURS['Critical']}'>Critical: {counts['Critical']}</font> &nbsp; "
         f"<font color='{SEVERITY_COLOURS['Minor']}'>Minor: {counts['Minor']}</font> &nbsp; "
         f"<font color='{SEVERITY_COLOURS['Info']}'>Info: {counts['Info']}</font>",
-        styles["Normal"],
+        meta_style,
     ))
-    flow.append(Spacer(1, 0.3 * cm))
+    flow.append(HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#cccccc"),
+                           spaceBefore=6, spaceAfter=0))
 
     if not issues:
-        flow.append(Paragraph("No updates required — the page passed every checklist item.", styles["Normal"]))
+        flow.append(Spacer(1, 0.3 * cm))
+        flow.append(Paragraph("No updates required — the page passed every checklist item.", issue_style))
 
     for i, issue in enumerate(issues, start=1):
         colour = SEVERITY_COLOURS.get(issue.get("severity", "Info"), "#333333")
-        # The numbered instruction line, with a small step/rule + severity tag.
         rule_tag = f" <font color='#888888'>[{_html_escape(issue['ruleId'])}]</font>" if issue.get("ruleId") else ""
         sev = issue.get("severity", "Info")
-        flow.append(Spacer(1, 0.25 * cm))
+        problem, change = _issue_lines(issue)
+
+        # Generous gap so adjacent issues don't feel packed together.
+        flow.append(Spacer(1, 0.45 * cm))
         flow.append(Paragraph(
-            f"<b>({i})</b> {_html_escape(_instruction_text(issue))}"
-            f"{rule_tag} <font color='{colour}'>({_html_escape(sev)})</font>",
-            styles["Normal"],
+            f"<b>({i})</b> {_html_escape(problem)} "
+            f"<font color='{colour}'><b>({_html_escape(sev)})</b></font>{rule_tag}",
+            issue_style,
         ))
         if issue.get("excerpt"):
             flow.append(Paragraph(
-                f"&nbsp;&nbsp;&nbsp;&nbsp;<i>Current: &ldquo;{_html_escape(issue['excerpt'])}&rdquo;</i>",
-                styles["Normal"],
+                f"<b>Current:</b> &ldquo;{_html_escape(issue['excerpt'])}&rdquo;",
+                detail_style,
             ))
+        if change:
+            flow.append(Paragraph(f"<b>Change as:</b> {_html_escape(change)}", detail_style))
         if issue.get("screenshot"):
             try:
                 data = base64.b64decode(issue["screenshot"])
@@ -149,7 +223,10 @@ def generate_pdf(report: dict, out_path: str) -> str:
                                   width=nat_w_pt * scale,
                                   height=nat_h_pt * scale))
             except Exception:
-                flow.append(Paragraph("<i>(screenshot could not be embedded)</i>", styles["Italic"]))
+                flow.append(Paragraph("<i>(screenshot could not be embedded)</i>", base["Italic"]))
+        # Light divider between adjacent issues.
+        flow.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#e6e6e6"),
+                               spaceBefore=8, spaceAfter=0))
 
     # Overall sign-off (Step ✔ of the checklist), kept compact at the end.
     reasoning = report.get("reasoning")
@@ -159,10 +236,10 @@ def generate_pdf(report: dict, out_path: str) -> str:
         flow.append(Spacer(1, 0.5 * cm))
         flow.append(Paragraph(
             f"<b>Overall result:</b> <font color='{v_colour}'>{verdict}</font>",
-            styles["Normal"],
+            base["Normal"],
         ))
         if reasoning.get("summary"):
-            flow.append(Paragraph(_html_escape(reasoning["summary"]), styles["Normal"]))
+            flow.append(Paragraph(_html_escape(reasoning["summary"]), base["Normal"]))
 
     doc.build(flow)
     return out_path

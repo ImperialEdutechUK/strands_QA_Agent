@@ -194,7 +194,7 @@ def _is_transient(exc: BaseException) -> bool:
     return any(marker in msg for marker in _TRANSIENT_ERROR_MARKERS)
 
 
-def invoke_with_retry(agent: Agent, prompt: str, *, max_attempts: int = 5,
+def invoke_with_retry(agent: Agent, prompt: str, *, max_attempts: int = 2,
                       backoff_seconds: float = 4.0):
     """Run the agent, retrying on transient OpenRouter / streaming failures.
 
@@ -202,8 +202,11 @@ def invoke_with_retry(agent: Agent, prompt: str, *, max_attempts: int = 5,
     history across calls, so a retried `agent(prompt)` re-uses any tool calls
     that already succeeded and only re-issues the steps that didn't.
 
-    Backoff is exponential (4, 8, 16, 32 s) so a sustained ~30 s provider
-    wobble doesn't burn through the budget in the first 12 seconds.
+    Kept deliberately low (2 attempts: the initial try plus one retry after a
+    4 s backoff) so a genuinely failing run doesn't re-drive the whole tool
+    chain several times and rack up token cost. The per-call LLM client already
+    retries transient 429s/5xx internally, so this outer retry only needs to
+    cover a single hard streaming drop, not sustained provider trouble.
     """
     last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):

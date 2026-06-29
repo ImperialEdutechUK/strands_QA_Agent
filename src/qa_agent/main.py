@@ -11,6 +11,7 @@ in the compliance step.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ from .tools.web_tools import (
 
 load_dotenv()
 configure_logging()
+logger = logging.getLogger(__name__)
 
 
 @click.command()
@@ -44,6 +46,13 @@ def main(url: str, template_path: str | None, template_text: str | None, out: st
         template_path=template_path,
         template_text=template_text,
     )
+    # The agent self-review is kept for our logs only — strip it from the report
+    # so it never reaches the PDF / JSON artefact. (The `reason` tool still runs;
+    # we just don't surface its verdict to the reviewer.)
+    reasoning = report.pop("reasoning", None)
+    if reasoning:
+        logger.info("agent self-review (logs only): %s", json.dumps(reasoning, ensure_ascii=False))
+
     report.setdefault("url", url)
     attach_issue_screenshots(report)
     _resolve_evidence_tokens(report)

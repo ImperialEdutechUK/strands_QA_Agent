@@ -129,6 +129,105 @@ _HIDE_OVERLAYS_JS = r"""
 """
 
 
+# Expand collapsed FAQ accordions / toggles / native <details> so their answer
+# text is rendered (and therefore captured by innerText and screenshottable).
+# Many FAQ sections keep each answer hidden (display:none / collapsed panel)
+# until its heading is clicked; without this pass the agent never sees the
+# answer content and so cannot check that it aligns with its FAQ heading or the
+# course details. We also click generic "View more" / "Show more" / "Load more"
+# reveal buttons (step 4) — course-curriculum / module lists are routinely
+# truncated behind one of these, with the remaining modules hidden until clicked,
+# so without this the agent only ever QAs the surface modules against the
+# qualification specification, not the full curriculum.
+# We only *open* sections — we never close, navigate or alter the text. Real
+# navigation links are skipped so a toggle that is actually an <a href> can't
+# take us off-page.
+_EXPAND_SECTIONS_JS = r"""
+() => {
+    let opened = 0;
+
+    // 1. Native <details>/<summary>: force open without a click.
+    document.querySelectorAll('details:not([open])').forEach((d) => {
+        try { d.open = true; opened++; } catch (e) {}
+    });
+
+    const safeToClick = (el) => {
+        if (!el) return false;
+        // Don't follow real navigation; in-page (#...) / JS toggles are fine.
+        if (el.tagName === 'A') {
+            const href = el.getAttribute('href') || '';
+            if (href && !href.startsWith('#') && !href.startsWith('javascript:')) return false;
+        }
+        // Skip anything that already reports itself as expanded/open.
+        if (el.getAttribute('aria-expanded') === 'true') return false;
+        return true;
+    };
+
+    // 2. ARIA accordions: click controls explicitly marked collapsed.
+    document.querySelectorAll('[aria-expanded="false"]').forEach((el) => {
+        try { if (safeToClick(el)) { el.click(); opened++; } } catch (e) {}
+    });
+
+    // 3. Common FAQ / accordion / tab toggles that don't use aria-expanded.
+    const toggleSel = [
+        '.accordion-toggle', '.accordion-header', '.accordion-button.collapsed',
+        '.accordion-title', '.accordion__title', '.accordion-trigger',
+        '[class*="accordion" i] [class*="head" i]',
+        '[class*="accordion" i] [class*="title" i]',
+        '[class*="faq" i] [class*="question" i]',
+        '[class*="faq" i] [class*="title" i]',
+        '[class*="faq" i] [class*="toggle" i]',
+        '.elementor-tab-title:not(.elementor-active)',
+        '.et_pb_toggle_title',
+        '[data-toggle="collapse"]', '[data-bs-toggle="collapse"]'
+    ].join(',');
+    document.querySelectorAll(toggleSel).forEach((el) => {
+        try { if (safeToClick(el)) { el.click(); opened++; } } catch (e) {}
+    });
+
+    // 4. Generic "View more" / "Show more" / "Read more" / "Load more" reveal
+    //    controls. A course curriculum / module list is commonly truncated to
+    //    the first few items with the rest hidden behind one of these buttons.
+    //    They are usually NOT aria-accordions and don't match the FAQ/accordion
+    //    selectors above, so without this pass the hidden modules never reach
+    //    innerText and the curriculum can't be QA'd in full against the spec.
+    //    Match on the control's own short label so we don't click large blocks
+    //    that merely contain the words, and never click a "show less / collapse"
+    //    control (which would re-hide content we just revealed).
+    const MORE_RE = /^\s*(?:\+\s*)?(?:view|show|read|see|load|display|reveal)\s+(?:more|all|full|the\s+full|complete)\b|\bview\s+full\b|\bfull\s+curriculum\b|\bexpand(?:\s+all)?\b|\b(?:all|more)\s+modules?\b|\bsee\s+(?:the\s+)?(?:full|complete|entire)\b/i;
+    const LESS_RE = /\b(?:less|collapse|hide|fewer)\b/i;
+    const moreSel = [
+        'button', '[role="button"]',
+        '[class*="view-more" i]', '[class*="viewmore" i]',
+        '[class*="show-more" i]', '[class*="showmore" i]',
+        '[class*="read-more" i]', '[class*="readmore" i]',
+        '[class*="load-more" i]', '[class*="loadmore" i]',
+        '[class*="see-more" i]', '[class*="seemore" i]',
+        '[class*="more-link" i]', '[class*="moretoggle" i]',
+        '[class*="expand" i]', 'a'
+    ].join(',');
+    const moreSeen = new Set();
+    let moreClicks = 0;
+    document.querySelectorAll(moreSel).forEach((el) => {
+        if (moreClicks >= 40 || moreSeen.has(el)) return;
+        moreSeen.add(el);
+        let label = '';
+        try {
+            label = ('' + (el.innerText || el.textContent || el.getAttribute('aria-label') || '')).trim();
+        } catch (e) { return; }
+        // Reveal-button labels are short; a long string means we matched a
+        // wrapper, not the actual control.
+        if (!label || label.length > 60) return;
+        if (LESS_RE.test(label) || !MORE_RE.test(label)) return;
+        if (!safeToClick(el)) return;
+        try { el.click(); opened++; moreClicks++; } catch (e) {}
+    });
+
+    return opened;
+}
+"""
+
+
 def _navigate(page: Page, url: str) -> None:
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     try:
@@ -139,15 +238,53 @@ def _navigate(page: Page, url: str) -> None:
         page.evaluate(_HIDE_OVERLAYS_JS)
     except Exception as exc:  # noqa: BLE001
         logger.debug("overlay hide failed (continuing): %s", exc)
+    try:
+        page.evaluate(_EXPAND_SECTIONS_JS)
+        page.wait_for_timeout(600)  # let expanded FAQ panels render before reading
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("section expand failed (continuing): %s", exc)
+
+
+def _truncate_head_at_word(text: str, limit: int) -> str:
+    """``text[:limit]`` backtracked to a whitespace boundary so the slice never
+    ends mid-word.
+
+    A naive ``text[:limit]`` can land inside a word — e.g. slicing
+    "...recognised qualifications designed..." at the wrong offset leaves
+    "...recognised qualifications d", which the spell/grammar checker then
+    reports as a real "cut off mid-word / incomplete sentence" error. Backtracking
+    to the last space (or newline) means the slice always ends on a whole word.
+    """
+    if len(text) <= limit:
+        return text
+    # Only trim if the cut actually lands inside a word (both sides non-space).
+    if text[limit - 1].strip() and text[limit].strip():
+        boundary = max(text.rfind(" ", 0, limit), text.rfind("\n", 0, limit))
+        if boundary > 0:
+            return text[:boundary].rstrip()
+    return text[:limit].rstrip()
+
+
+def _truncate_tail_at_word(text: str, limit: int) -> str:
+    """Last ``limit`` chars, advanced past any leading partial word, so a tail
+    slice never *begins* mid-word (the mirror of `_truncate_head_at_word`)."""
+    if len(text) <= limit:
+        return text
+    start = len(text) - limit
+    if text[start].strip() and text[start - 1].strip():
+        nxt = text.find(" ", start)
+        if nxt != -1 and nxt - start < 200:
+            return text[nxt:].lstrip()
+    return text[start:].lstrip()
 
 
 def _cap_text(text: str) -> str:
     if len(text) <= SCRAPE_TEXT_LLM_CAP:
         return text
     return (
-        text[:SCRAPE_TEXT_HEAD_CHUNK]
+        _truncate_head_at_word(text, SCRAPE_TEXT_HEAD_CHUNK)
         + "\n\n... [content truncated; tail preserved] ...\n\n"
-        + text[-SCRAPE_TEXT_TAIL_CHUNK:]
+        + _truncate_tail_at_word(text, SCRAPE_TEXT_TAIL_CHUNK)
     )
 
 
