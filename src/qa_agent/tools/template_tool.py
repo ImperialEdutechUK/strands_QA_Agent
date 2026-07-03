@@ -13,16 +13,20 @@ the LLM, which produces the structured rule list (`{summary, rules: [...]}`).
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import logging
 import os
 import re
+from collections import OrderedDict
 from pathlib import Path
 
 import pytesseract
 from PIL import Image
 
 from ..llm_client import call_llm_json
+from ..ocr_preprocess import configure_tesseract
 from ..security import (
     ALLOWED_DOC_SUFFIXES,
     ALLOWED_IMAGE_SUFFIXES,
@@ -33,8 +37,18 @@ from ..security import (
 
 logger = logging.getLogger(__name__)
 
-if os.environ.get("TESSERACT_CMD"):
-    pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
+# Discover the tesseract binary robustly (TESSERACT_CMD, then PATH, then the
+# well-known install locations) rather than relying on an env var that may not be
+# set at import time — a missing path here silently OCR'd nothing.
+configure_tesseract()
+
+# The template parse is the CORE of the agent — it turns the QA template into the
+# rules everything else is checked against — so it must run to COMPLETION, never
+# fail-fast to the baseline checklist. We give it a generous OUTPUT-token budget so
+# a large rule set is emitted in full (not truncated), and let it take the time it
+# needs (no short timeout); with provider fallbacks enabled the request isn't
+# queued, so this completes promptly. Override the budget via env.
+_TEMPLATE_MAX_TOKENS = int(os.environ.get("QA_TEMPLATE_MAX_TOKENS", "8000"))
 
 SYSTEM = (
     "You convert QA template documents (often supplied as PDFs, Word files, "
@@ -235,6 +249,55 @@ def _merge_baseline(rules: list[dict]) -> list[dict]:
     return baseline + extra
 
 
+# Server-side cache of the merged rule list, keyed by a short `template_id`.
+# Mirrors the extraction cache: the agent holds only the id + a one-line summary,
+# never the full checklist JSON, so the rules aren't re-sent on every
+# orchestrator turn. `compliance` resolves the id back to the COMPLETE rule list,
+# so every rule is still checked — slimming the agent's view drops no rule.
+_TEMPLATE_CACHE: "OrderedDict[str, list]" = OrderedDict()
+_TEMPLATE_CACHE_MAX = int(os.environ.get("QA_TEMPLATE_CACHE_SIZE", "16"))
+
+
+def _cache_put_template(rules: list[dict]) -> str:
+    template_id = hashlib.sha256(
+        json.dumps(rules, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    _TEMPLATE_CACHE[template_id] = rules
+    _TEMPLATE_CACHE.move_to_end(template_id)
+    while len(_TEMPLATE_CACHE) > _TEMPLATE_CACHE_MAX:
+        _TEMPLATE_CACHE.popitem(last=False)
+    return template_id
+
+
+def get_cached_template_rules(template_id: str | None) -> list[dict] | None:
+    """Resolve a `template_id` to its cached merged rule list, or None."""
+    if not template_id:
+        return None
+    return _TEMPLATE_CACHE.get(template_id)
+
+
+def _finalise_template_result(summary: str, rules: list[dict],
+                              source_kind: str | None = None) -> dict:
+    """Cache the merged rules and return the small id-based result the agent holds.
+
+    The full `rules` list never goes back to the agent — only `template_id`
+    (to pass to `compliance`), the `summary`, the `rule_count`, and a single
+    `needs_spec` flag (true if ANY rule must be checked against the official
+    specification, which is all the agent needs to decide whether to run
+    `spec_lookup`).
+    """
+    template_id = _cache_put_template(rules)
+    out: dict = {
+        "template_id": template_id,
+        "summary": summary or "",
+        "rule_count": len(rules),
+        "needs_spec": any(bool(r.get("needs_spec")) for r in rules),
+    }
+    if source_kind:
+        out["source_kind"] = source_kind
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-format extraction helpers
 # ---------------------------------------------------------------------------
@@ -342,7 +405,7 @@ def _baseline_only(reason: str) -> dict:
     LLM, so the compliance/spec flow still runs against it — a rate-limited
     template parse must NOT wipe out the whole QA run.
     """
-    return {"summary": reason, "rules": _merge_baseline([])}
+    return _finalise_template_result(reason, _merge_baseline([]))
 
 
 def _llm_rules_from_text(label: str, extracted: str) -> dict:
@@ -356,7 +419,7 @@ def _llm_rules_from_text(label: str, extracted: str) -> dict:
         f'"""{truncate_text(extracted)}"""'
     )
     try:
-        result = call_llm_json(prompt, system=SYSTEM)
+        result = call_llm_json(prompt, system=SYSTEM, max_tokens=_TEMPLATE_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001 - never let a template parse failure
         # sink the whole run; fall back to the standard checklist.
         logger.warning(
@@ -367,10 +430,9 @@ def _llm_rules_from_text(label: str, extracted: str) -> dict:
             f"Template could not be parsed ({type(exc).__name__}); the standard "
             "QA checklist was applied instead."
         )
-    return {
-        "summary": result.get("summary", ""),
-        "rules": _merge_baseline(result.get("rules") or []),
-    }
+    return _finalise_template_result(
+        result.get("summary", ""), _merge_baseline(result.get("rules") or [])
+    )
 
 
 def analyse_template(template_path: str) -> dict:
@@ -411,7 +473,7 @@ def analyse_template_text(text: str) -> dict:
         return _baseline_only("Empty template — standard QA checklist applied.")
     prompt = f'{SCHEMA_INSTRUCTION}\n\nTEMPLATE TEXT:\n"""{truncate_text(text)}"""'
     try:
-        result = call_llm_json(prompt, system=SYSTEM)
+        result = call_llm_json(prompt, system=SYSTEM, max_tokens=_TEMPLATE_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001 - keep the run alive on LLM failure
         logger.warning(
             "template text parse via LLM failed (%s: %s) — applying the standard "
@@ -421,7 +483,6 @@ def analyse_template_text(text: str) -> dict:
             f"Template could not be parsed ({type(exc).__name__}); the standard "
             "QA checklist was applied instead."
         )
-    return {
-        "summary": result.get("summary", ""),
-        "rules": _merge_baseline(result.get("rules") or []),
-    }
+    return _finalise_template_result(
+        result.get("summary", ""), _merge_baseline(result.get("rules") or [])
+    )

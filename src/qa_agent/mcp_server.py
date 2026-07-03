@@ -24,7 +24,11 @@ from .tools.compliance_tool import check_compliance
 from .tools.reasoning_tool import review_findings
 from .tools.spec_tool import lookup_specification
 from .tools.spell_tool import check_spelling
-from .tools.template_tool import analyse_template, analyse_template_text
+from .tools.template_tool import (
+    analyse_template,
+    analyse_template_text,
+    get_cached_template_rules,
+)
 from .tools.web_tools import capture_excerpts, scrape_page, take_screenshot
 
 load_dotenv()
@@ -77,9 +81,12 @@ async def extract(url: str, use_wordpress: bool = True, capture_screenshots: boo
         learner numbers) and QA-priority scoring.
 
     The FULL structured report is written to disk (path returned as
-    `report_path`); this tool returns a compact summary — counts, the
-    high-priority banners/images, and any extraction warnings — to keep the
-    agent's context small. Read `report_path` for the complete evidence.
+    `report_path`) and the page text + all banner/image/FAQ evidence is cached
+    server-side under `extraction_id`; this tool returns only a compact summary
+    — counts, `course_identity` (qualification number / level / variant for
+    spec_lookup), price candidates and any extraction warnings — to keep the
+    agent's context small. `spell` / `compliance` read the cached evidence by
+    `extraction_id`; read `report_path` for the complete evidence.
     """
     _check_auth(auth_token)
     return await asyncio.to_thread(
@@ -158,18 +165,20 @@ def template(document_path: str | None = None, text: str | None = None,
 @mcp.tool()
 async def spec_lookup(course_name: str, qualification_number: str = "",
                       level: str = "", awarding_body: str = "",
+                      variant: str = "", document_path: str | None = None,
                       auth_token: str | None = None) -> dict:
-    """Find the official Qualification Specification for a course via web search.
+    """Resolve the official Qualification Specification for a course.
 
-    Pass the course name plus any of `qualification_number`, `level`,
-    `awarding_body` taken from the page. Searches the web (keyless), fetches the
-    most relevant awarding-body / Ofqual pages, and returns structured spec
-    parameters: `{found, specification:{level, qualification_number,
-    accreditation_status, credit_equivalency, glh, tqt, awarding_body, ...},
-    source_urls}`. Pass the whole returned object to `compliance` as
-    `specification` so the needs_spec rules are checked against it. On failure
-    it returns `found: false` — then the needs_spec rules are flagged for manual
-    verification rather than guessed.
+    Pass the course name plus any of `qualification_number`, `level`, `variant`,
+    `awarding_body` taken from step 1's `course_identity`. If the user uploaded a
+    specification sheet, pass its path as `document_path` and the spec is read
+    straight from that document — matched STRICTLY to this qualification's number
+    and variant (one sheet can list many courses) — instead of web search.
+    Otherwise it web-searches (keyless) the awarding-body / Ofqual pages. Returns
+    `{found, specification:{level, qualification_number, accreditation_status,
+    credit_equivalency, glh, tqt, awarding_body, ...}, source_urls}`. Pass the
+    whole returned object to `compliance` as `specification`. On failure it
+    returns `found: false` and the needs_spec rules are silently skipped.
     """
     _check_auth(auth_token)
     return await asyncio.to_thread(
@@ -177,11 +186,14 @@ async def spec_lookup(course_name: str, qualification_number: str = "",
         qualification_number=qualification_number,
         level=level,
         awarding_body=awarding_body,
+        variant=variant,
+        document_path=document_path,
     )
 
 
 @mcp.tool()
-def compliance(rules: list, extraction_id: str | None = None,
+def compliance(template_id: str | None = None, extraction_id: str | None = None,
+               rules: list | None = None,
                page_text: str | None = None, headings: list | None = None,
                price_candidates: list[str] | None = None,
                banner_evidence: list | None = None,
@@ -190,14 +202,29 @@ def compliance(rules: list, extraction_id: str | None = None,
                auth_token: str | None = None) -> dict:
     """Audit page text, headings, banners and images against QA template rules.
 
-    Preferred usage: pass `rules` (from the `template` tool) and `extraction_id`
-    (from the `extract` tool). The page text, headings, price candidates and the
-    high-priority banner/image evidence are then resolved server-side, so claims
-    that live in banners or are baked into images (via OCR) are compared against
-    the rules too — without the agent having to copy any large blobs into this
-    call. The explicit parameters remain available for direct use.
+    Preferred usage: pass `template_id` (from the `template` tool) and
+    `extraction_id` (from the `extract` tool). The full rule list is resolved
+    from `template_id` server-side, and the page text, headings, price
+    candidates and the high-priority banner/image evidence are resolved from
+    `extraction_id`, so claims that live in banners or are baked into images
+    (via OCR) are compared against the rules too — without the agent having to
+    copy any large blobs into this call. An explicit `rules` list is still
+    accepted for direct use / backwards compatibility.
     """
     _check_auth(auth_token)
+    if not rules and template_id:
+        rules = get_cached_template_rules(template_id)
+        if rules is None:
+            # The rules were cached then evicted (or a bad id): fail loudly so
+            # the run records an honest tool_failure rather than silently
+            # checking the page against zero rules.
+            raise ValueError(
+                f"Unknown template_id '{template_id}'. Re-run `template` first."
+            )
+    if not rules:
+        return {"issues": []}
+    course_identity: dict | None = None
+    bold_texts: list | None = None
     if extraction_id:
         cached = get_cached_extraction(extraction_id)
         if cached is None:
@@ -209,6 +236,8 @@ def compliance(rules: list, extraction_id: str | None = None,
         price_candidates = price_candidates if price_candidates is not None else cached.get("price_candidates", [])
         banner_evidence = banner_evidence if banner_evidence is not None else cached.get("banner_evidence", [])
         image_evidence = image_evidence if image_evidence is not None else cached.get("image_evidence", [])
+        course_identity = cached.get("course_identity")
+        bold_texts = cached.get("bold_texts", [])
     return check_compliance(
         page_text=page_text or "",
         headings=headings or [],
@@ -217,6 +246,8 @@ def compliance(rules: list, extraction_id: str | None = None,
         banner_evidence=banner_evidence,
         image_evidence=image_evidence,
         specification=specification,
+        course_identity=course_identity,
+        bold_texts=bold_texts,
     )
 
 

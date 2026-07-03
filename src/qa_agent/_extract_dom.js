@@ -91,20 +91,68 @@
     return "";
   };
 
+  // Where on the page a heading lives. Structural (main-content) headings are
+  // the ones a reference-page diff may compare; review titles, FAQ questions,
+  // curriculum unit names, footer/nav/popup headings legitimately differ
+  // between courses and must not be flagged as "missing sections".
+  const zoneOf = (el) => {
+    if (ancestorMatch(el, /comment|review|testimonial/i)) return "review";
+    if (ancestorMatch(el, /footer/i)) return "footer";
+    if (ancestorMatch(el, /header|masthead|navbar|topbar/i)) return "header";
+    if (ancestorMatch(el, /popup|modal/i)) return "popup";
+    if (ancestorMatch(el, /sidebar|widget-area/i)) return "sidebar";
+    if (ancestorMatch(el, /accordion|faq|toggle|tab-title|tab-content|curriculum/i)) return "accordion";
+    return "main";
+  };
+
   // ---------------- general content ----------------
   try {
     const g = out.general;
     g.page_title = document.title || "";
     const h1 = document.querySelector("h1");
     g.h1 = h1 ? clean(h1.innerText) : "";
-    g.headings = Array.from(document.querySelectorAll("h1,h2,h3"))
-      .slice(0, 150)
-      .map((h) => ({ tag: h.tagName.toLowerCase(), text: clean(h.innerText) }))
+    g.headings = Array.from(document.querySelectorAll("h1,h2,h3,h4"))
+      .slice(0, 600)
+      .map((h) => ({ tag: h.tagName.toLowerCase(), text: clean(h.innerText), zone: zoneOf(h) }))
       .filter((h) => h.text);
 
+    // Verbatim BOLD text runs (<b>/<strong> plus computed font-weight >= 600).
+    // Bold is a DOM fact, not a judgement call — collecting it here lets the
+    // QA checks verify "X is shown in bold" deterministically instead of
+    // asking a vision model to eyeball font weight from screenshots.
+    try {
+      const boldSet = new Set();
+      const pushBold = (t) => {
+        t = clean(t);
+        if (t && t.length >= 2 && t.length <= 120) boldSet.add(t);
+      };
+      document.querySelectorAll("b, strong").forEach((el) => {
+        const c = ctx(el);
+        if (c.visible) pushBold(el.innerText);
+      });
+      let scannedBold = 0;
+      document.querySelectorAll("span, em, a, p, li, td").forEach((el) => {
+        if (scannedBold++ > 4000 || boldSet.size >= 200) return;
+        if (el.children.length > 2) return; // leaf-ish runs only
+        const t = ("" + (el.innerText || "")).trim();
+        if (!t || t.length > 120) return;
+        let cs;
+        try { cs = getComputedStyle(el); } catch (e) { return; }
+        if (parseInt(cs.fontWeight, 10) >= 600) pushBold(t);
+      });
+      g.bold_texts = Array.from(boldSet).slice(0, 200);
+    } catch (e) {
+      g.bold_texts = [];
+      out.warnings.push("bold text scan error: " + e.message);
+    }
+
+    // Capture the WHOLE rendered page body — these caps are deliberately huge so
+    // a long course page is never cut off in the middle (the assessment /
+    // curriculum / careers sections sit mid-page). The full text is persisted and
+    // cached server-side, so downstream QA reads every section, not just the head.
     const bodyText = document.body ? document.body.innerText : "";
-    g.raw_text = (bodyText || "").slice(0, 100000);
-    g.cleaned_text = clean(bodyText).slice(0, 60000);
+    g.raw_text = (bodyText || "").slice(0, 1000000);
+    g.cleaned_text = clean(bodyText).slice(0, 1000000);
     g.main_visible_text = g.cleaned_text;
 
     const mt = document.querySelector('meta[property="og:title"], meta[name="title"]');

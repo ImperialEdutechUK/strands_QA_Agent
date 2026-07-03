@@ -399,7 +399,10 @@ def take_screenshot(url: str, selector: str | None = None, full_page: bool = Tru
 _WALK_UP_JS = r"""
 (el) => {
     const vh = window.innerHeight || 900;
-    const maxH = vh * 0.8;   // never return more than ~one screenful
+    // Keep the crop TIGHT around the offending text — reviewers asked for just the
+    // part with the issue, not a whole screenful (which was pulling in the nav bar,
+    // hero banner and unrelated copy). ~1/3 of the viewport is enough context.
+    const maxH = vh * 0.34;
     const BLOCK = new Set(['p','li','h1','h2','h3','h4','h5','h6','td','th',
         'dd','dt','figcaption','blockquote','label','a','button','span','div']);
     const isBlock = (n) => {
@@ -524,6 +527,15 @@ def _candidate_snippets(text: str) -> list[str]:
             out.append(s)
 
     push(text)
+    # The model often COMPOSES an excerpt by joining separate page items with
+    # " - " / " | " / newlines (e.g. "Course Highlights - Access Duration: 365
+    # Days - Awarded by: ..."). That composite never exists verbatim in the
+    # DOM, so also try each segment, longest first — the most distinctive one
+    # usually locates the right block.
+    segments = [s for s in re.split(r"\s+[-–|•]\s+|\n", text) if len(s.strip()) >= 8]
+    if len(segments) > 1:
+        for seg in sorted(segments, key=len, reverse=True)[:4]:
+            push(seg)
     if len(text) > 60:
         push(text[:60])
     if len(text) > 30:
@@ -561,7 +573,7 @@ def _is_blank_png(buf: bytes, min_unique_colours: int = 4) -> bool:
         img = PILImage.open(BytesIO(buf)).convert("RGB")
         # Sample at low res — fast and good enough to detect "all one colour".
         small = img.resize((32, 32))
-        unique = len(set(small.get_flattened_data()))
+        unique = len(set(small.getdata()))
     except Exception:
         return False  # if we can't read it, let the caller decide
     return unique < min_unique_colours
@@ -720,6 +732,9 @@ def attach_issue_screenshots(report: dict) -> dict:
         for issue in issues
         if isinstance(issue, dict) and not issue.get("screenshot")
         and (issue.get("excerpt") or "").strip()
+        # Reference-diff findings quote the REFERENCE page — that text is by
+        # definition absent from the page under review, so don't hunt for it.
+        and not str(issue.get("ruleId", "")).upper().startswith("REF")
     ]
     if not wanted:
         return report

@@ -210,6 +210,13 @@ def generate_pdf(report: dict, out_path: str) -> str:
         if change:
             flow.append(Paragraph(f"<b>Change as:</b> {_html_escape(change)}", detail_style))
         if issue.get("screenshot"):
+            if issue.get("screenshot_caption"):
+                # e.g. "Reference page — the 'Buy Now' button..." so the image
+                # is never mistaken for the page under review.
+                flow.append(Paragraph(
+                    f"<i>{_html_escape(issue['screenshot_caption'])}</i>",
+                    detail_style,
+                ))
             try:
                 data = base64.b64decode(issue["screenshot"])
                 nat_w_px, nat_h_px = ImageReader(BytesIO(data)).getSize()

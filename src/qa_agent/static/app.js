@@ -95,9 +95,19 @@ function renderIssue(issue, index) {
     el.appendChild(f);
   }
   if (issue.screenshot && /^[A-Za-z0-9+/=]+$/.test(issue.screenshot.slice(0, 40))) {
+    // Caption first — for reference-diff findings the image shows the
+    // REFERENCE page (what to add), and the reviewer must know that before
+    // reading the crop as the page under review.
+    if (issue.screenshot_caption) {
+      const cap = document.createElement("p");
+      cap.className = "issue__field muted";
+      cap.textContent = issue.screenshot_caption;
+      el.appendChild(cap);
+    }
     const img = document.createElement("img");
     img.className = "issue__shot";
-    img.alt = `Evidence for: ${issue.excerpt || issue.description || ""}`;
+    img.alt = issue.screenshot_caption
+      || `Evidence for: ${issue.excerpt || issue.description || ""}`;
     img.loading = "lazy";
     img.src = `data:image/png;base64,${issue.screenshot}`;
     el.appendChild(img);
@@ -189,10 +199,13 @@ async function submitForm(ev) {
   startTimer();
 
   const fd = new FormData(form);
-  // Drop the file entry if no file was actually selected (else server tries to parse empty upload).
-  const fileInput = $("#template_document");
-  if (!fileInput.files || fileInput.files.length === 0) {
-    fd.delete("template_document");
+  // Drop any file entry with no file actually selected (else the server tries
+  // to parse an empty upload).
+  for (const name of ["template_document", "spec_document"]) {
+    const input = document.querySelector(`#${name}`);
+    if (!input || !input.files || input.files.length === 0) {
+      fd.delete(name);
+    }
   }
 
   try {

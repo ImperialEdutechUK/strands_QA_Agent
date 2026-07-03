@@ -26,21 +26,34 @@
                  placeholder="https://example.com/course/your-course">
         </label>
 
+        <label class="field">
+          <span class="field__label">Reference course URL (optional)</span>
+          <input type="url" name="reference_url" id="reference_url"
+                 placeholder="https://example.com/course/a-published-approved-course">
+          <span class="field__hint">A known-good published course page. The agent diffs this page's structure against it — sections, buttons and key banners present on the reference but missing here are flagged.</span>
+        </label>
+
         <fieldset class="field">
           <legend class="field__label">QA template (optional)</legend>
-          <p class="field__hint">Provide either inline text rules <em>or</em> upload a template document.</p>
-
-          <label class="subfield">
-            <span>Template text</span>
-            <textarea name="template_text" id="template_text" rows="4"
-                      placeholder="e.g. All headings sentence case. Page must include learning outcomes and price."></textarea>
-          </label>
+          <p class="field__hint">Upload a template document containing the QA rules.</p>
 
           <label class="subfield">
             <span>Template document</span>
             <input type="file" name="template_document" id="template_document"
                    accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.tif,.gif">
             <span class="field__hint">PDF, Word .docx, or image. The document's text and any embedded images are extracted (OCR'd) and used as the rules. PDFs/DOCX ≤ 20 MB; images ≤ 10 MB. Requires Tesseract on the server.</span>
+          </label>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend class="field__label">Qualification specification (optional)</legend>
+          <p class="field__hint">Upload the official specification sheet so the agent checks against the correct document instead of searching the web. If the sheet covers several qualifications, the agent matches your course by its qualification number and exact variant (e.g. <em>Extended</em> Diploma vs Diploma).</p>
+
+          <label class="subfield">
+            <span>Specification document</span>
+            <input type="file" name="spec_document" id="spec_document"
+                   accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.tif,.gif">
+            <span class="field__hint">PDF, Word .docx, or image. PDFs/DOCX ≤ 20 MB; images ≤ 10 MB.</span>
           </label>
         </fieldset>
 

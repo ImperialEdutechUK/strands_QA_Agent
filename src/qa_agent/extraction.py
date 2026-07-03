@@ -32,12 +32,10 @@ import os
 import re
 from collections import OrderedDict
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from PIL import Image as PILImage
 from playwright.sync_api import Page, TimeoutError as PWTimeoutError, sync_playwright
 
 from .security import (
@@ -56,25 +54,44 @@ from .tools.web_tools import (
 logger = logging.getLogger(__name__)
 
 # OCR is optional: if Tesseract isn't installed we still return everything else
-# and record a warning rather than failing the whole extraction.
+# and record a warning rather than failing the whole extraction. Tesseract
+# discovery + the OpenCV-assisted multi-variant OCR live in `ocr_preprocess`,
+# which probes the binary lazily (not just at import time) so a forgotten
+# TESSERACT_CMD can't silently disable OCR for a whole run.
 try:  # pragma: no cover - import guard
-    import pytesseract
+    from .ocr_preprocess import ocr_png as _ocr_png_best
+    from .ocr_preprocess import tesseract_available as _tesseract_available
 
-    if os.environ.get("TESSERACT_CMD"):
-        pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
     _OCR_IMPORTED = True
 except Exception:  # noqa: BLE001
-    pytesseract = None  # type: ignore
+    _ocr_png_best = None  # type: ignore
+    _tesseract_available = None  # type: ignore
     _OCR_IMPORTED = False
 
 NAV_TIMEOUT_MS = 45_000
 LOAD_BEST_EFFORT_MS = 8_000
 SCROLL_SETTLE_MS = 900
+# How many times to re-run the accordion/'+' expand pass. Lazy, nested and
+# late-mounting panels (FAQs, course-content toggles) often need 2-3 passes
+# before everything is open; we stop early once a pass opens nothing new.
+SECTION_EXPAND_PASSES = int(os.environ.get("QA_SECTION_EXPAND_PASSES", "4"))
 
 # Bounds so a hostile / huge page can't blow up memory or OCR cost.
 MAX_OCR_IMAGES = int(os.environ.get("QA_EXTRACTION_MAX_OCR", "40"))
 MIN_OCR_AREA_PX = 2_000          # skip OCR on tiny icons
 MIN_OCR_CONFIDENCE = 45          # below this we keep the text but flag low confidence
+
+# How much of the page body the compliance / spell checks may read. Set to the
+# FULL page (a very high ceiling, NOT a head/tail window): the old head-6000 +
+# tail-2000 cap dropped the whole MIDDLE of the page, where the 'Method of
+# Assessment', 'Curriculum', 'Career Progression' etc. sections live — so
+# compliance never saw e.g. the 'no formal examinations' statement and falsely
+# flagged it "not stated". The full text is cached server-side and used in a
+# SINGLE compliance call (never re-emitted across agent turns), well within the
+# model's context, so the whole page is reviewed — nothing is cut off mid-page.
+# The ceiling only guards against a pathologically huge document, not real course
+# pages. Override via QA_COMPLIANCE_TEXT_CHARS.
+COMPLIANCE_TEXT_CHARS = int(os.environ.get("QA_COMPLIANCE_TEXT_CHARS", "1000000"))
 
 # Server-side cache of per-run extraction inputs (page text + headings + price
 # candidates + banner/image evidence), keyed by a short `extraction_id`.
@@ -388,41 +405,20 @@ def _banner_priority(banner_type: str, claims: dict, ocr_text: str, banner: dict
 def ocr_available() -> bool:
     if not _OCR_IMPORTED:
         return False
-    try:
-        pytesseract.get_tesseract_version()  # type: ignore[union-attr]
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    return _tesseract_available()  # type: ignore[misc]
 
 
-def _ocr_png(png_bytes: bytes) -> tuple[str, float]:
-    """OCR a PNG. Returns (text, mean_confidence 0-100). Empty on any failure."""
-    if not png_bytes:
+def _ocr_png(png_bytes: bytes, *, thorough: bool = False) -> tuple[str, float]:
+    """OCR a PNG via the OpenCV-assisted pipeline.
+
+    Returns (text, mean_confidence 0-100); empty on any failure. ``thorough``
+    forces the full multi-variant pass (used for banners — few in number and
+    always QA-relevant), recovering low-contrast / light-on-dark banner text that
+    a single plain pass returns empty on.
+    """
+    if not png_bytes or not _OCR_IMPORTED:
         return "", 0.0
-    try:
-        with PILImage.open(BytesIO(png_bytes)) as img:
-            rgb = img.convert("RGB")
-            data = pytesseract.image_to_data(  # type: ignore[union-attr]
-                rgb, output_type=pytesseract.Output.DICT  # type: ignore[union-attr]
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("OCR failed: %s", exc)
-        return "", 0.0
-    words, confs = [], []
-    for word, conf in zip(data.get("text", []), data.get("conf", [])):
-        word = (word or "").strip()
-        if not word:
-            continue
-        try:
-            c = float(conf)
-        except (TypeError, ValueError):
-            c = -1.0
-        if c >= 0:
-            confs.append(c)
-        words.append(word)
-    text = _clean(" ".join(words))
-    mean_conf = (sum(confs) / len(confs)) if confs else 0.0
-    return text, round(mean_conf, 1)
+    return _ocr_png_best(png_bytes, thorough=thorough)  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -727,8 +723,14 @@ def _format_faq_block(faq_items: list[dict]) -> str:
     """
     if not faq_items:
         return ""
-    lines = ["FAQ SECTION (each answer captured under its own question):"]
-    budget = 6000
+    # State the TRUE count in the header: the entries below may be trimmed for
+    # length, and the 'approximately 20 FAQs' volume rule must be judged on the
+    # real number captured, not on how many survived the character budget.
+    lines = [
+        f"FAQ SECTION — {len(faq_items)} FAQs captured on the page "
+        f"(each answer under its own question; entries may be trimmed for length):"
+    ]
+    budget = int(os.environ.get("QA_FAQ_BLOCK_CHARS", "24000"))
     for item in faq_items:
         q = (item.get("question") or "").strip()
         a = (item.get("answer") or "").strip()
@@ -755,12 +757,21 @@ def _navigate(page: Page, url: str) -> None:
     # Expand collapsed FAQ accordions / toggles / <details> so each answer's
     # text is rendered next to its heading and captured by the DOM extraction
     # below — otherwise hidden answers can't be QA'd against their FAQ heading
-    # or the course content.
-    try:
-        page.evaluate(_EXPAND_SECTIONS_JS)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("section expand best-effort failed: %s", exc)
-    page.wait_for_timeout(SCROLL_SETTLE_MS)
+    # or the course content. Several passes are needed: many '+' accordions
+    # render their panel lazily AFTER the first click, nest inside one another,
+    # or are still mounting when the first pass runs. A single pass left whole
+    # sections (FAQs, 'Who Is This Course For?', etc.) collapsed, which the QA
+    # step then mis-reported as "section missing".
+    for _ in range(SECTION_EXPAND_PASSES):
+        try:
+            opened = page.evaluate(_EXPAND_SECTIONS_JS)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("section expand best-effort failed: %s", exc)
+            break
+        page.wait_for_timeout(SCROLL_SETTLE_MS)
+        # Stop early once a pass finds nothing new left to open.
+        if not opened:
+            break
 
 
 def _screenshot_dir(url: str) -> Path:
@@ -803,6 +814,10 @@ def extract_page(
     use_wordpress: bool = True,
     capture_screenshots: bool = True,
     run_ocr: bool = True,
+    # The per-click FAQ/accordion capture clicks every toggle in turn — slow on
+    # FAQ-heavy pages. Callers that don't consume `faq_items` (e.g. the
+    # reference structural diff) skip it.
+    capture_faq: bool = True,
 ) -> dict:
     """Run the full layered extraction and return the structured QA-evidence report.
 
@@ -850,7 +865,7 @@ def extract_page(
             )
             # Per-click FAQ/accordion capture runs LAST so its clicking can't
             # shift element positions for the image/banner screenshots above.
-            faq_items = _capture_faq_items(page)
+            faq_items = _capture_faq_items(page) if capture_faq else []
         finally:
             browser.close()
 
@@ -881,6 +896,7 @@ def _shape_general(g: dict, wp: dict | None) -> dict:
         "page_title": g.get("page_title", "") or (wp.get("title") if wp else ""),
         "h1": g.get("h1", ""),
         "headings": g.get("headings", []),
+        "bold_texts": g.get("bold_texts", []),
         "main_visible_text": g.get("main_visible_text", ""),
         "raw_text": g.get("raw_text", ""),
         "cleaned_text": g.get("cleaned_text", ""),
@@ -1003,7 +1019,11 @@ def _process_banners(page, raw_banners, shot_dir, ocr_ok, warnings) -> list[dict
             if png:
                 screenshot_path = str(dest)
         if png and ocr_ok:
-            ocr_text, conf = _ocr_png(png)
+            # Banners are few and always QA-relevant (price / guarantee / trust /
+            # CTA text is often baked in as low-contrast image text), so always
+            # run the full OpenCV multi-variant pass rather than escalating only
+            # on a weak first read.
+            ocr_text, conf = _ocr_png(png, thorough=True)
             if ocr_text and conf and conf < MIN_OCR_CONFIDENCE:
                 notes.append(f"OCR confidence low ({conf}%)")
 
@@ -1050,6 +1070,61 @@ def _dedupe(items: list[str]) -> list[str]:
             seen.add(it)
             out.append(it)
     return out
+
+
+# Awarding / endorsing bodies that commonly appear in a course title or
+# overview. Used only to surface a course-identity HINT for spec_lookup — the
+# agent no longer receives the banner/body evidence in its context, so we lift
+# these few precise fields out here instead. Nothing is invented: every field
+# is a literal match from the page, or empty.
+_KNOWN_AWARDING_BODIES = (
+    "Qualifi", "Pearson", "TQUK", "OTHM", "NCFE", "Highfield", "City & Guilds",
+    "City and Guilds", "ILM", "CMI", "ABMA", "Open University", "Focus Awards",
+    "Gatehouse Awards", "Innovate Awarding", "Skillsfirst", "ATHE",
+    "Quality Licence Scheme", "QLS", "CPD",
+)
+
+_QUAL_NUMBER_RE = re.compile(r"\b\d{3}/\d{4}/[\dxX]\b")        # Ofqual, e.g. 610/1675/5
+_QLS_NUMBER_RE = re.compile(r"\bQLS[-\s]?\d{3,6}\b", re.I)     # Quality Licence Scheme code
+_LEVEL_RE = re.compile(r"\bLevel\s+\d+\b", re.I)
+# Most specific variant first so 'Extended Diploma' wins over 'Diploma'.
+_VARIANT_RE = re.compile(
+    r"\bExtended\s+Diploma\b|\bExtended\s+Certificate\b|\bDiploma\b|"
+    r"\bCertificate\b|\bAward\b",
+    re.I,
+)
+
+
+def _detect_course_identity(gc: dict, page_text: str) -> dict:
+    """Deterministic course-identity hints for spec_lookup.
+
+    spec_lookup must pin the EXACT qualification variant (an 'Extended Diploma'
+    is a different, larger qualification than a plain 'Diploma'). We surface the
+    qualification number, level and variant verbatim from the page so the lookup
+    is grounded rather than guessed. Title/h1/meta are searched before the body
+    because they carry the authoritative course name.
+    """
+    title = (gc.get("h1") or gc.get("page_title") or "").strip()
+    haystack = " ".join(filter(None, [
+        gc.get("page_title", ""), gc.get("h1", ""),
+        gc.get("meta_title", ""), gc.get("meta_description", ""),
+        (page_text or "")[:4000],
+    ]))
+    qn = _QUAL_NUMBER_RE.search(haystack) or _QLS_NUMBER_RE.search(haystack)
+    level = _LEVEL_RE.search(haystack)
+    variant = _VARIANT_RE.search(title) or _VARIANT_RE.search(haystack)
+    awarding_body = ""
+    for body in _KNOWN_AWARDING_BODIES:
+        if re.search(rf"\b{re.escape(body)}\b", haystack, re.I):
+            awarding_body = body
+            break
+    return {
+        "course_name": title,
+        "qualification_number": qn.group(0) if qn else "",
+        "level": level.group(0).title() if level else "",
+        "variant": variant.group(0).title() if variant else "",
+        "awarding_body": awarding_body,
+    }
 
 
 def extract_page_summary(
@@ -1101,27 +1176,32 @@ def extract_page_summary(
     banner_evidence = [slim_banner(b) for b in report["banners"] if b["qa_priority"] == "high"]
     image_evidence = [slim_image(i) for i in report["images"] if i["qa_priority"] == "high"]
 
-    # Fold per-click-captured FAQ answers into the page text the spell/compliance
-    # checks read. Single-open accordions only ever leave their LAST answer in
-    # the snapshot text, so each Q&A is appended here as a labelled block. We keep
-    # body + FAQ within the compliance read window (~8000 chars) so the FAQ — the
-    # content we want aligned against its heading and the course details — is
-    # never sliced off the end downstream.
+    # Build the page text the spell/compliance checks read from the FULL body
+    # (the whole page, only bounded by the very large COMPLIANCE_TEXT_CHARS safety
+    # ceiling), NOT the tiny head+tail `capped_text` used for the agent summary.
+    # Per-click-captured FAQ answers are then APPENDED as a labelled block:
+    # single-open accordions only ever leave their LAST answer in the snapshot
+    # text, and the FAQ does not steal from the body budget (the old head+tail cap
+    # truncated the assessment statement out and caused false "section not stated"
+    # findings).
+    compliance_body = _truncate_head_at_word(full_text, COMPLIANCE_TEXT_CHARS)
     faq_items = report.get("faq_items") or []
     faq_block = _format_faq_block(faq_items)
     if faq_block:
-        head_room = max(1500, 8000 - len(faq_block) - 20)
-        page_text_for_checks = f"{_truncate_head_at_word(capped_text, head_room)}\n\n{faq_block}"
+        page_text_for_checks = f"{compliance_body}\n\n{faq_block}"
     else:
-        page_text_for_checks = capped_text
+        page_text_for_checks = compliance_body
 
+    course_identity = _detect_course_identity(gc, page_text_for_checks)
     # Stash the heavy inputs server-side; the model only ever sees `extraction_id`.
     _cache_put(extraction_id, {
         "page_text": page_text_for_checks,
         "headings": gc.get("headings", []),
+        "bold_texts": gc.get("bold_texts", []),
         "price_candidates": price_candidates,
         "banner_evidence": banner_evidence,
         "image_evidence": image_evidence,
+        "course_identity": course_identity,
     })
 
     return {
@@ -1132,6 +1212,10 @@ def extract_page_summary(
         "text_total_chars": len(full_text),
         "text_truncated": len(full_text) > len(capped_text),
         "price_candidates": price_candidates,
+        # Deterministic identity hints lifted from the page so spec_lookup can
+        # pin the exact qualification variant without the agent eyeballing the
+        # (now server-side) evidence.
+        "course_identity": course_identity,
         "general_content": {
             "page_title": gc["page_title"],
             "h1": gc["h1"],
@@ -1142,39 +1226,93 @@ def extract_page_summary(
             "link_count": len(gc["links"]),
             "cta_count": len(gc["cta_buttons"]),
         },
-        # Trimmed previews only (full evidence is cached + on disk). The agent
-        # does NOT need to copy these anywhere — compliance reads them by id.
-        "high_priority_banners": banner_evidence[:8],
-        "high_priority_images": image_evidence[:12],
-        # FAQ Q&A captured by clicking each (single-open) accordion in turn. The
-        # full text is already folded into the cached page_text the checks read;
-        # this preview lets the agent/UI see what was captured.
+        # Evidence (every banner, image, FAQ Q&A, OCR snippet, screenshot) is
+        # cached server-side under `extraction_id` and written to `report_path`;
+        # `spell` / `compliance` read it by id. We deliberately DON'T ship those
+        # blobs into the agent's context — they were re-billed on every
+        # orchestrator turn for no benefit. Only counts are surfaced here.
+        "high_priority_banner_count": len(banner_evidence),
+        "high_priority_image_count": len(image_evidence),
         "faq_count": len(faq_items),
-        "faq_items": faq_items[:30],
         "extraction_warnings": report["extraction_warnings"],
     }
 
 
+# A concrete currency value (the course price looks like one of these).
+_PRICE_VALUE_RE = re.compile(
+    r"(?:£|GBP|EUR|€|USD|\$)\s?\d[\d,]*(?:\.\d{1,2})?|\d[\d,]*\s?(?:GBP|USD|EUR|pounds?)",
+    re.I,
+)
+# Words that mark a currency value as a PRICE (a course fee / purchase), used to
+# tell a real price apart from the many other £ figures on a course page.
+_PRICE_CTX_RE = re.compile(
+    r"\b(?:price|pricing|fee|cost|pay|payable|buy|purchase|checkout|enrol|enroll|"
+    r"enquire|deposit|instal(?:ment)?|offer|discount|rrp|was|now|only|from|save|"
+    r"special|bundle)\b",
+    re.I,
+)
+# Words that mark a currency value as a SALARY / earnings figure — these litter
+# 'Career Progression' sections and must NOT be mistaken for the course price.
+_SALARY_CTX_RE = re.compile(
+    r"\b(?:salary|salaries|earn(?:ing)?s?|wage|income|per\s+(?:year|annum|month|hour)|"
+    r"p\.?a\.?|annually|annual|pension|revenue|turnover|average)\b",
+    re.I,
+)
+
+
+def _price_snippets(text: str, *, require_ctx: bool) -> list[str]:
+    """Currency values that look like a course price, with a little context.
+
+    ``require_ctx`` forces a nearby price word (used for body text, where £
+    figures are often salaries); banner/image/CTA text relaxes it but still drops
+    anything sitting next to salary/earnings wording.
+    """
+    out: list[str] = []
+    for m in _PRICE_VALUE_RE.finditer(text or ""):
+        window = text[max(0, m.start() - 45): m.end() + 25]
+        if _SALARY_CTX_RE.search(window):
+            continue
+        if require_ctx and not _PRICE_CTX_RE.search(window):
+            continue
+        out.append(window)
+    return out
+
+
 def _collect_price_candidates(report: dict) -> list[str]:
-    """Gather pricing evidence from page text + banner/image claims (for compliance)."""
+    """Gather likely course-price evidence from page text + banners + images.
+
+    Scans far more widely than the old claim-flag-only check (which missed a
+    price baked into a banner image), while excluding salary figures so a
+    'Career Progression' £35,000 is never read as the course fee.
+    """
     cands: list[str] = []
     seen: set[str] = set()
 
-    def push(s: str) -> None:
-        s = _clean(s)
-        if s and s.lower() not in seen:
-            seen.add(s.lower())
-            cands.append(s)
+    def push_all(snippets: list[str]) -> None:
+        for s in snippets:
+            s = _clean(s)
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                cands.append(s)
 
-    for snippet in detect_claims(report["general_content"].get("cleaned_text", ""))["price"]:
-        push(snippet)
+    gc = report["general_content"]
+    # Body text: require a price word so salaries / fines aren't taken as the fee.
+    push_all(_price_snippets(gc.get("raw_text", "") or gc.get("cleaned_text", ""),
+                             require_ctx=True))
+    # Banners & images live in promo / pricing / CTA blocks, so a currency value
+    # there is almost always the price — scan their visible text AND OCR/alt text
+    # even when the claim detector didn't flag it.
     for b in report["banners"]:
-        if b["claims_detected"].get("price"):
-            push(b["cleaned_combined_text"][:140] or "; ".join(b["claims_detected"]["price"]))
+        push_all(_price_snippets(
+            b.get("cleaned_combined_text", "") or b.get("visible_text_html", ""),
+            require_ctx=False))
     for i in report["images"]:
-        if "price" in i["claim_types"]:
-            push(i.get("cleaned_ocr_text") or i.get("alt_text") or "")
-    return cands[:8]
+        txt = " ".join(filter(None, [
+            i.get("cleaned_ocr_text", ""), i.get("alt_text", ""),
+            i.get("nearby_text", ""), i.get("caption", ""),
+        ]))
+        push_all(_price_snippets(txt, require_ctx=False))
+    return cands[:10]
 
 
 def _persist_report(url: str, report: dict) -> str:

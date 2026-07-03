@@ -1,7 +1,27 @@
+import logging
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from ..llm_client import call_llm_json
 from .web_tools import _truncate_head_at_word
+
+logger = logging.getLogger(__name__)
+
+# Spellcheck the WHOLE page, not just the first screenful — a typo in the
+# mid-page assessment/curriculum sections was never seen under the old 12k head
+# cap. The full text is cached server-side and reviewed in one call. Override via
+# QA_SPELL_READ_CHARS / QA_SPELL_PROMPT_BYTES.
+_SPELL_READ_CHARS = int(os.environ.get("QA_SPELL_READ_CHARS", "1000000"))
+_SPELL_PROMPT_BYTES = int(os.environ.get("QA_SPELL_PROMPT_BYTES", str(2 * 1024 * 1024)))
+# Pages longer than this are reviewed in several parallel LLM calls instead of
+# one giant one. One huge prompt made the provider occasionally return an EMPTY
+# body (surfacing as "LLM did not return valid JSON"), and a single failure lost
+# the whole spell pass. Spelling/grammar issues are local to their sentence, so
+# chunking at paragraph boundaries loses nothing; every chunk still gets the
+# full system prompt. Chunks run concurrently, so this is also faster.
+_SPELL_CHUNK_CHARS = int(os.environ.get("QA_SPELL_CHUNK_CHARS", "28000"))
+_SPELL_MAX_WORKERS = max(1, int(os.environ.get("QA_SPELL_MAX_WORKERS", "3")))
 
 SYSTEM = (
     "You are a meticulous UK English copy editor reviewing course web page content. "
@@ -76,12 +96,40 @@ _NON_ISSUE_RE = re.compile(
 )
 
 
+# A "missing space / words run together" complaint. When the offending excerpt is
+# predominantly UPPER-CASE it is almost always two separate on-screen labels from a
+# badge / highlights bar that the DOM extraction glued together (e.g. "OFQUAL
+# REGULATED QUALIFICATION" + "CENTRE NUMBER" -> "QUALIFICATIONCENTRE"), NOT an
+# authored typo. Real prose spacing errors are in normal-case body copy, so this
+# only suppresses the layout artefact.
+_SPACING_ISSUE_RE = re.compile(
+    r"missing\s+space|space\s+(?:between|is\s+missing|needed)|run[\s-]?together|"
+    r"words?\s+(?:are\s+)?(?:run|joined|glued|merged|concatenat)|no\s+space|"
+    r"should\s+be\s+(?:two\s+words|separated)|lack(?:s|ing)?\s+a?\s*space",
+    re.I,
+)
+
+
+def _is_layout_concat_spacing(issue: dict) -> bool:
+    desc = f"{issue.get('description', '')} {issue.get('suggestion', '')}"
+    if not _SPACING_ISSUE_RE.search(desc):
+        return False
+    letters = [c for c in str(issue.get("excerpt", "")) if c.isalpha()]
+    if not letters:
+        return False
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    return upper_ratio >= 0.6
+
+
 def _is_real_spell_issue(issue: dict) -> bool:
     """Keep only genuine, fixable spelling/grammar/punctuation problems."""
     if not isinstance(issue, dict):
         return False
     blob = f"{issue.get('description', '')} {issue.get('suggestion', '')}"
     if _NON_ISSUE_RE.search(blob):
+        return False
+    # Two glued-together UI labels wrongly reported as a missing-space typo.
+    if _is_layout_concat_spacing(issue):
         return False
     excerpt = (issue.get("excerpt") or "").strip()
     suggestion = (issue.get("suggestion") or "").strip()
@@ -91,11 +139,64 @@ def _is_real_spell_issue(issue: dict) -> bool:
     return bool(str(issue.get("description", "")).strip())
 
 
-def check_spelling(text: str) -> dict:
-    trimmed = _truncate_head_at_word(text or "", 12000)
-    prompt = f'{SCHEMA_INSTRUCTION}\n\nTEXT TO REVIEW:\n"""{trimmed}"""'
-    result = call_llm_json(prompt, system=SYSTEM)
+def _split_chunks(text: str, size: int) -> list[str]:
+    """Split at word boundaries (preferring paragraph breaks) into <=size chunks."""
+    chunks: list[str] = []
+    rest = text
+    while len(rest) > size:
+        head = _truncate_head_at_word(rest, size)
+        # Prefer to end the chunk at a paragraph break so no sentence is split
+        # across two calls (a mid-sentence cut would look like a typo).
+        cut = head.rfind("\n\n")
+        if cut > size // 2:
+            head = head[:cut]
+        chunks.append(head)
+        rest = rest[len(head):].lstrip()
+    if rest.strip():
+        chunks.append(rest)
+    return chunks
+
+
+def _check_chunk(chunk: str) -> list[dict]:
+    prompt = f'{SCHEMA_INSTRUCTION}\n\nTEXT TO REVIEW:\n"""{chunk}"""'
+    result = call_llm_json(prompt, system=SYSTEM, max_prompt_bytes=_SPELL_PROMPT_BYTES)
     issues = result.get("issues") or []
-    if not isinstance(issues, list):
-        return {"issues": []}
-    return {"issues": [i for i in issues if _is_real_spell_issue(i)]}
+    return [i for i in issues if isinstance(i, dict)] if isinstance(issues, list) else []
+
+
+def check_spelling(text: str) -> dict:
+    """Full-page UK-English review.
+
+    Long pages are reviewed in parallel paragraph-boundary chunks; issues are
+    concatenated in page order. If SOME chunks fail we still return the issues
+    from the ones that succeeded, with `failed_chunks`/`chunks` counts so the
+    caller can surface an honest partial-failure note. Only a total failure
+    (every chunk) raises.
+    """
+    trimmed = _truncate_head_at_word(text or "", _SPELL_READ_CHARS)
+    chunks = _split_chunks(trimmed, _SPELL_CHUNK_CHARS) or [""]
+
+    if len(chunks) == 1:
+        issues = _check_chunk(chunks[0])
+        return {"issues": [i for i in issues if _is_real_spell_issue(i)]}
+
+    results: list[list[dict] | None] = [None] * len(chunks)
+    errors: list[Exception] = []
+    with ThreadPoolExecutor(max_workers=_SPELL_MAX_WORKERS,
+                            thread_name_prefix="spell") as pool:
+        futures = {pool.submit(_check_chunk, c): i for i, c in enumerate(chunks)}
+        for fut, idx in futures.items():
+            try:
+                results[idx] = fut.result()
+            except Exception as exc:  # noqa: BLE001 — partial results still count
+                logger.warning("spell chunk %d/%d failed: %s: %s",
+                               idx + 1, len(chunks), type(exc).__name__, str(exc)[:160])
+                errors.append(exc)
+    if errors and all(r is None for r in results):
+        raise errors[0]
+    issues = [i for r in results if r for i in r]
+    out = {"issues": [i for i in issues if _is_real_spell_issue(i)]}
+    if errors:
+        out["failed_chunks"] = len(errors)
+        out["chunks"] = len(chunks)
+    return out

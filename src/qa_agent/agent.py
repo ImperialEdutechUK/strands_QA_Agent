@@ -236,37 +236,47 @@ Strict rules — these exist because every LLM call costs money:
   * Use exactly this fixed order — skip a step if its inputs are missing:
       1. `extract(url)` — the primary extraction stage. It renders the page in a
          browser and returns a SMALL summary: `extraction_id`, `stats`,
-         `general_content`, `price_candidates`, trimmed `high_priority_banners`
-         / `high_priority_images` previews, `extraction_warnings`, and a
-         `report_path` (the FULL evidence report — banners, every image, OCR
-         text, claims, screenshots — written to disk). The full page text and
-         evidence are cached server-side under `extraction_id`. CRITICAL: do
-         NOT copy page text, banner evidence or image evidence into later tool
-         calls — just pass the small `extraction_id`. Do NOT read `report_path`.
+         `general_content`, `price_candidates`, `course_identity` (course_name,
+         qualification_number, level, variant, awarding_body — use these in
+         step 4), evidence counts, `extraction_warnings`, and a `report_path`
+         (the FULL evidence report — banners, every image, OCR text, claims,
+         screenshots — written to disk). The full page text and all banner /
+         image / FAQ evidence are cached server-side under `extraction_id` and
+         read directly by `spell` / `compliance`. CRITICAL: do NOT try to copy
+         page text or evidence into later tool calls — just pass the small
+         `extraction_id`. Do NOT read `report_path`.
       2. `template(...)`        — only if a template was provided. The
          template may be inline `text`, OR a `document_path` to an image,
          PDF, or Word `.docx` (whichever the user supplied — pass the path
-         through verbatim, don't try to read or parse the file yourself).
+         through verbatim, don't try to read or parse the file yourself). It
+         returns a small `{template_id, summary, rule_count, needs_spec}`; the
+         full rule list is cached server-side under `template_id`. Keep that id
+         for step 5 and do NOT try to reproduce or copy the rules yourself.
       3. `spell(extraction_id)` — pass the `extraction_id` from step 1 (the
          server resolves the page text). Do NOT paste the page text here.
-      4. `spec_lookup(course_name, ...)` — ONLY if step 2 returned at least one
-         rule with `needs_spec: true`. Pass the course name EXACTLY as shown
-         (from step 1's page_title / h1, keeping words like "Extended" — an
-         "Extended Diploma" is a different qualification from a plain "Diploma"),
-         and ALWAYS pass the `qualification_number` (e.g. 610/1675/5), `level`
-         and `awarding_body` whenever they appear on the page (look in the
-         Course Highlights / header). The qualification number is what pins down
-         the correct spec variant, so never omit it if it is on the page. It
+      4. `spec_lookup(course_name, ...)` — ONLY if step 2's result has
+         `needs_spec: true`. Take the arguments from step 1's `course_identity`:
+         pass `course_name` EXACTLY as given (keep words like "Extended" — a
+         "Level 5 Extended Diploma" is a DIFFERENT qualification from a "Level 5
+         Diploma"), and ALWAYS pass `qualification_number` (e.g. 610/1675/5),
+         `level` and `awarding_body` whenever `course_identity` provides them.
+         The qualification number is what pins down the correct spec variant, so
+         never omit it when it is present. If the user message includes a "QA
+         specification file path", ALSO pass it as `document_path` and pass
+         `variant` from `course_identity`: the spec is then read from that
+         uploaded sheet (matched strictly to this qualification's number /
+         variant — one sheet may list many courses) instead of web search. It
          web-searches for the official Qualification Specification and returns a
          `{found, specification, source_urls}` object. Keep that object to pass
          into the next step. Copy its `source_urls` into the report's
          `specification_source` field so the reviewer can see exactly which
          specification document you checked against. Skip this step entirely if
          no rule needs a spec.
-      5. `compliance(rules, extraction_id, specification)` — only if step 2
-         returned rules. Pass the `rules` from step 2, the `extraction_id` from
-         step 1, and (if you ran step 4) the whole object it returned as
-         `specification`. The server resolves the page text, headings, price
+      5. `compliance(template_id, extraction_id, specification)` — only if you
+         ran step 2. Pass the `template_id` from step 2, the `extraction_id`
+         from step 1, and (if you ran step 4) the whole object it returned as
+         `specification`. The server resolves the full rule list from
+         `template_id`, plus the page text, headings, price
          candidates and the high-priority banner/image evidence, so claims that
          live in banners or are baked into images (price, discount,
          accreditation, awarding body, guarantee, rating, urgency, etc.) are
@@ -363,12 +373,18 @@ def build_agent(mcp_url: str | None = None):
         yield agent, client
 
 
-def build_user_prompt(url: str, template_path: str | None, template_text: str | None) -> str:
+def build_user_prompt(url: str, template_path: str | None, template_text: str | None,
+                      spec_path: str | None = None) -> str:
     parts = [f"Course URL: {url}"]
     if template_path:
         parts.append(f"QA template file path: {template_path}")
     if template_text:
         parts.append(f"QA template text:\n{template_text}")
+    if spec_path:
+        parts.append(
+            f"QA specification file path: {spec_path}\n"
+            f"(Pass this to spec_lookup as `document_path` for the needs_spec rules.)"
+        )
     token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
     if token:
         parts.append("All tool calls must include `auth_token` set to the configured MCP token.")

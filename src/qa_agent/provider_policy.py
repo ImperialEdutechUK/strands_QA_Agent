@@ -1,56 +1,59 @@
 """OpenRouter provider-routing policy.
 
-Every LLM request we send to OpenRouter is annotated with a `provider` block
-that:
-  * restricts routing to an explicit ALLOW-LIST of providers — only
-    DigitalOcean, AtlasCloud and DeepInfra are permitted; OpenRouter will not
-    route the request to any other provider;
-  * sets `data_collection: "deny"` so the allowed providers only handle the
-    request if they contractually do NOT log, retain, or train on the prompt;
-  * disables fallbacks — if none of the allowed providers can serve the
-    request we want it to FAIL loudly rather than silently route elsewhere.
+By DEFAULT this is now PERMISSIVE: OpenRouter may route each request to ANY
+provider, with fallbacks enabled, so a request is never queued behind a small
+allow-list of saturated providers (which was surfacing as sustained HTTP 429s and
+minutes-long "the run is stuck" behaviour). Availability is the priority.
 
-The defaults below can be overridden via env vars without touching code:
-  OPENROUTER_ONLY_PROVIDERS    — comma-separated, replaces the allow-list
-  OPENROUTER_ALLOW_FALLBACKS   — "1" to re-enable provider fallbacks; default
-                                 is "0" (disabled) so the request fails rather
-                                 than spilling onto a provider outside the
-                                 allow-list.
+Everything is opt-in via env vars, so a privacy-sensitive deployment can re-tighten
+the policy without touching code:
+
+  OPENROUTER_ONLY_PROVIDERS   — comma-separated allow-list (e.g. "DeepInfra,Novita").
+                                Empty (default) = no restriction, any provider.
+  OPENROUTER_ALLOW_FALLBACKS  — "0" to disable provider fallbacks; default "1"
+                                (enabled) so a busy provider spills to the next.
+  OPENROUTER_DATA_COLLECTION  — "deny" to only use providers that contractually do
+                                NOT log/retain/train on the prompt (GDPR-style
+                                privacy, but a smaller pool that CAN queue), or
+                                "allow" (default) to permit any provider so the
+                                request is never held back.
 """
 
 from __future__ import annotations
 
 import os
 
-# The ONLY providers OpenRouter is permitted to route to. Anything not in this
-# list is excluded, regardless of OpenRouter's own eligibility scoring.
-_DEFAULT_ALLOWED_PROVIDERS = (
-    "DigitalOcean",
-    "AtlasCloud",
-    "DeepInfra",
-)
 
-
-def _csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+def _csv_env(name: str) -> tuple[str, ...]:
     raw = os.environ.get(name, "").strip()
     if not raw:
-        return default
+        return ()
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def openrouter_provider_block() -> dict:
-    """Return the `provider` payload to attach to every OpenRouter request."""
-    allowed = _csv_env("OPENROUTER_ONLY_PROVIDERS", _DEFAULT_ALLOWED_PROVIDERS)
-    # Fallbacks are OFF by default: if no allowed provider can serve the
-    # request, fail rather than route to a provider outside the allow-list.
-    allow_fallbacks = os.environ.get("OPENROUTER_ALLOW_FALLBACKS", "0").strip() == "1"
+    """Return the `provider` payload to attach to every OpenRouter request.
 
-    block: dict = {
-        # Hard allow-list: route ONLY to these providers, nothing else.
-        "only": list(allowed),
-        # Of the allowed providers, refuse any that would log or retain the prompt.
-        "data_collection": "deny",
-        # No spilling onto providers outside the allow-list.
-        "allow_fallbacks": allow_fallbacks,
-    }
+    Permissive by default (any provider, fallbacks on) so requests aren't queued;
+    tighten via the OPENROUTER_* env vars documented in the module docstring.
+    """
+    block: dict = {}
+
+    # Allow-list is OPT-IN now. When empty we send no `only` key, so OpenRouter is
+    # free to route to whatever provider can serve the model soonest.
+    allowed = _csv_env("OPENROUTER_ONLY_PROVIDERS")
+    if allowed:
+        block["only"] = list(allowed)
+
+    # Fallbacks ON by default: if the first-choice provider is busy/at capacity,
+    # spill to the next eligible one rather than failing or waiting.
+    block["allow_fallbacks"] = os.environ.get("OPENROUTER_ALLOW_FALLBACKS", "1").strip() != "0"
+
+    # Privacy filter is OPT-IN. Default "allow" keeps the provider pool as large as
+    # possible (no queueing); set OPENROUTER_DATA_COLLECTION=deny to restrict to
+    # non-logging providers if the deployment needs that guarantee.
+    dc = os.environ.get("OPENROUTER_DATA_COLLECTION", "allow").strip().lower()
+    if dc == "deny":
+        block["data_collection"] = "deny"
+
     return block

@@ -59,13 +59,30 @@ REPORTS_DIR = REPO_ROOT / "reports"
 TEMPLATE_UPLOADS_DIR = REPO_ROOT / "templates" / "uploads"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 TEMPLATE_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+# Uploaded specification sheets live under the same allowed-template root so the
+# spec tool's `safe_resolve_template` accepts them.
+SPEC_UPLOADS_DIR = REPO_ROOT / "templates" / "spec_uploads"
+SPEC_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 MCP_URL = os.environ.get("MCP_URL", "http://127.0.0.1:3001/mcp")
+
+# Default: run the deterministic pipeline (tools called directly in code — no
+# orchestrator LLM, no MCP round-trip). Cheaper (only the analytical LLM calls
+# remain) and hallucination-free at the report-assembly stage. Set
+# QA_USE_PIPELINE=0 to route through the Strands agent + MCP server instead.
+USE_PIPELINE = os.environ.get("QA_USE_PIPELINE", "1").strip() != "0"
 
 # Reasonable upper bounds on text fields so a malicious form post can't OOM the
 # server. The agent itself caps things further downstream.
 MAX_URL_LEN = 2048
 MAX_TEMPLATE_TEXT_LEN = 16 * 1024
+
+# Optional wall-clock budget for one QA run. DISABLED by default (0): a slow run
+# that finishes in, say, 16 minutes was being cut off at 900s and replaced with a
+# placeholder "timed out" report, throwing away the real (already-completed)
+# result. We now let the run finish and return the genuine report. Set
+# QA_RUN_TIMEOUT_SECONDS to a positive number to re-enable a hard cap.
+AGENT_RUN_TIMEOUT = float(os.environ.get("QA_RUN_TIMEOUT_SECONDS", "0"))
 
 
 def _ts() -> str:
@@ -85,13 +102,64 @@ def _resolve_evidence_tokens(report: dict) -> None:
             issue.pop("screenshot", None)
 
 
-def _run_agent_sync(url: str, template_path: str | None, template_text: str | None) -> dict:
-    """Blocking agent invocation. Called via asyncio.to_thread from the route handler."""
+async def _save_form_upload(upload, dest_dir: Path, label: str) -> Path | None:
+    """Validate + persist a multipart file upload; return its path (or None)."""
+    if upload is None or not getattr(upload, "filename", ""):
+        return None
+    suffix = Path(upload.filename).suffix.lower()
+    if suffix not in ALLOWED_TEMPLATE_SUFFIXES:
+        raise HTTPException(
+            400,
+            f"Unsupported {label} file type: {suffix}. "
+            f"Allowed: {sorted(ALLOWED_TEMPLATE_SUFFIXES)}",
+        )
+    data = await upload.read()
+    max_size = MAX_DOC_BYTES if suffix in ALLOWED_DOC_SUFFIXES else MAX_IMAGE_BYTES
+    if len(data) > max_size:
+        raise HTTPException(413, f"{label.capitalize()} file exceeds size limit.")
+    dest = dest_dir / f"{uuid4().hex}{suffix}"
+    dest.write_bytes(data)
+    return dest
+
+
+def _run_agent_sync(url: str, template_path: str | None, template_text: str | None,
+                    spec_path: str | None = None,
+                    reference_url: str | None = None) -> dict:
+    """Blocking QA invocation. Called via asyncio.to_thread from the route handler.
+
+    Default path is the deterministic pipeline (`pipeline.py`): the tools run
+    directly in this process and the report is assembled in code, so the run
+    needs no orchestrator LLM and no MCP server. QA_USE_PIPELINE=0 restores the
+    Strands-agent-over-MCP path.
+    """
+    if USE_PIPELINE:
+        from .pipeline import run_qa_pipeline
+
+        try:
+            report = run_qa_pipeline(url, template_path, template_text, spec_path,
+                                     reference_url=reference_url)
+        except Exception as exc:  # noqa: BLE001 — never lose the run
+            return {
+                "course_name": "QA run incomplete",
+                "url": url,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "template_summary": None,
+                "issues": [],
+                "tool_failures": [f"pipeline: {type(exc).__name__}: {redact(str(exc))}"],
+            }
+        reasoning = report.pop("reasoning", None)
+        if reasoning:
+            logger.info("pipeline self-review (logs only): %s",
+                        json.dumps(reasoning, ensure_ascii=False))
+        report.setdefault("url", url)
+        attach_issue_screenshots(report)
+        return report
+
     # Imported lazily so the web process boots even if Strands has init issues.
     from .agent import build_agent, build_user_prompt, invoke_with_retry
 
     with build_agent() as (agent, _client):
-        prompt = build_user_prompt(url, template_path, template_text)
+        prompt = build_user_prompt(url, template_path, template_text, spec_path)
         try:
             result = invoke_with_retry(agent, prompt)
         except Exception as exc:
@@ -190,30 +258,33 @@ async def run_qa(request: Request) -> JSONResponse:
     url: str | None = None
     template_text: str | None = None
     template_path: str | None = None
-    saved_upload: Path | None = None
+    spec_path: str | None = None
+    reference_url: str | None = None
+    saved_uploads: list[Path] = []
 
     if "multipart/form-data" in content_type:
         form = await request.form()
         url = (form.get("url") or "").strip() or None
         template_text = (form.get("template_text") or "").strip() or None
+        reference_url = (form.get("reference_url") or "").strip() or None
         # Prefer the new `template_document` field; accept the legacy
         # `template_image` name too so older clients keep working.
-        upload = form.get("template_document") or form.get("template_image")
-        if upload is not None and getattr(upload, "filename", ""):
-            suffix = Path(upload.filename).suffix.lower()
-            if suffix not in ALLOWED_TEMPLATE_SUFFIXES:
-                raise HTTPException(
-                    400,
-                    f"Unsupported template file type: {suffix}. "
-                    f"Allowed: {sorted(ALLOWED_TEMPLATE_SUFFIXES)}",
-                )
-            data = await upload.read()
-            max_size = MAX_DOC_BYTES if suffix in ALLOWED_DOC_SUFFIXES else MAX_IMAGE_BYTES
-            if len(data) > max_size:
-                raise HTTPException(413, "Template file exceeds size limit.")
-            saved_upload = TEMPLATE_UPLOADS_DIR / f"{uuid4().hex}{suffix}"
-            saved_upload.write_bytes(data)
-            template_path = str(saved_upload)
+        tpl = await _save_form_upload(
+            form.get("template_document") or form.get("template_image"),
+            TEMPLATE_UPLOADS_DIR, "template",
+        )
+        if tpl is not None:
+            saved_uploads.append(tpl)
+            template_path = str(tpl)
+        # Optional official qualification specification sheet. When supplied the
+        # spec tool reads it directly (matched to this qualification) instead of
+        # web-searching for it.
+        spec = await _save_form_upload(
+            form.get("spec_document"), SPEC_UPLOADS_DIR, "specification",
+        )
+        if spec is not None:
+            saved_uploads.append(spec)
+            spec_path = str(spec)
     else:
         try:
             payload = await request.json()
@@ -221,7 +292,8 @@ async def run_qa(request: Request) -> JSONResponse:
             raise HTTPException(400, f"Invalid JSON body: {exc}")
         url = (payload.get("url") or "").strip() or None
         template_text = (payload.get("template_text") or "").strip() or None
-        # JSON path doesn't accept image uploads — clients should use multipart for that.
+        reference_url = (payload.get("reference_url") or "").strip() or None
+        # JSON path doesn't accept uploads — clients should use multipart for that.
 
     if not url:
         raise HTTPException(400, "Field `url` is required.")
@@ -233,15 +305,50 @@ async def run_qa(request: Request) -> JSONResponse:
         raise HTTPException(400, f"URL rejected: {exc}")
     if template_text and len(template_text) > MAX_TEMPLATE_TEXT_LEN:
         raise HTTPException(400, "template_text exceeds size limit.")
+    if reference_url:
+        if len(reference_url) > MAX_URL_LEN:
+            raise HTTPException(400, "Reference URL is too long.")
+        try:
+            reference_url = validate_public_url(reference_url)
+        except Exception as exc:
+            raise HTTPException(400, f"Reference URL rejected: {exc}")
 
     try:
-        report = await asyncio.to_thread(_run_agent_sync, url, template_path, template_text)
-    finally:
-        if saved_upload is not None:
+        agent_run = asyncio.to_thread(
+            _run_agent_sync, url, template_path, template_text, spec_path,
+            reference_url,
+        )
+        if AGENT_RUN_TIMEOUT > 0:
             try:
-                saved_upload.unlink(missing_ok=True)
+                report = await asyncio.wait_for(agent_run, timeout=AGENT_RUN_TIMEOUT)
+            except asyncio.TimeoutError:
+                # The worker thread can't be force-killed; it finishes in the
+                # background. We return an honest report so the browser isn't left
+                # hanging for tens of minutes.
+                logger.error("agent run exceeded %.0fs budget for %s", AGENT_RUN_TIMEOUT, url)
+                report = {
+                    "course_name": "QA run timed out",
+                    "url": url,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "template_summary": None,
+                    "issues": [],
+                    "tool_failures": [
+                        f"run exceeded the {int(AGENT_RUN_TIMEOUT)}s time budget — the LLM "
+                        "provider is most likely rate-limiting or slow. Retry, widen "
+                        "OPENROUTER_ONLY_PROVIDERS, enable fallbacks, or use a "
+                        "less-congested model."
+                    ],
+                }
+        else:
+            # No wall-clock cap (default): let the run finish and return the real
+            # report rather than discarding a completed run at an arbitrary limit.
+            report = await agent_run
+    finally:
+        for saved in saved_uploads:
+            try:
+                saved.unlink(missing_ok=True)
             except Exception as exc:
-                logger.warning("failed to remove temp upload %s: %s", saved_upload, exc)
+                logger.warning("failed to remove temp upload %s: %s", saved, exc)
 
     _resolve_evidence_tokens(report)
 
