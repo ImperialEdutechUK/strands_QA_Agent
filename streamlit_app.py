@@ -115,10 +115,6 @@ with st.form("qa_form"):
         "Reference page URL (optional)",
         placeholder="https://example.com/known-good-course",
     )
-    template_text = st.text_area(
-        "QA template text (optional)",
-        placeholder="All headings sentence case. Page must include learning outcomes.",
-    )
     template_file = st.file_uploader(
         "QA template document (optional)",
         type=["pdf", "docx", "png", "jpg", "jpeg", "webp"],
@@ -153,7 +149,7 @@ if submitted:
             report = run_qa_pipeline(
                 url,
                 template_path,
-                template_text or None,
+                None,
                 spec_path,
                 reference_url=reference_url or None,
             )
@@ -179,8 +175,27 @@ if submitted:
 
 report = st.session_state.get("last_report")
 if report:
-    st.subheader(report.get("course_name", "QA Report"))
-    st.caption(report.get("url", ""))
+    title_col, json_col, pdf_col = st.columns([4, 1, 1])
+    with title_col:
+        st.subheader(report.get("course_name", "QA Report"))
+        st.caption(report.get("url", ""))
+    with json_col:
+        st.download_button(
+            "Download JSON",
+            data=json.dumps(report, indent=2),
+            file_name=Path(st.session_state["last_json_path"]).name,
+            mime="application/json",
+            use_container_width=True,
+        )
+    with pdf_col:
+        pdf_bytes = Path(st.session_state["last_pdf_path"]).read_bytes()
+        st.download_button(
+            "Download PDF",
+            data=pdf_bytes,
+            file_name=Path(st.session_state["last_pdf_path"]).name,
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
     issues = report.get("issues", []) or []
     sev_order = {"Critical": 0, "Minor": 1, "Info": 2}
@@ -214,20 +229,3 @@ if report:
                     st.image(base64.b64decode(shot))
                 except Exception:
                     pass
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            "Download JSON",
-            data=json.dumps(report, indent=2),
-            file_name=Path(st.session_state["last_json_path"]).name,
-            mime="application/json",
-        )
-    with col2:
-        pdf_bytes = Path(st.session_state["last_pdf_path"]).read_bytes()
-        st.download_button(
-            "Download PDF",
-            data=pdf_bytes,
-            file_name=Path(st.session_state["last_pdf_path"]).name,
-            mime="application/pdf",
-        )
