@@ -295,10 +295,26 @@ def call_llm(
         if json_mode and not (content or "").strip():
             wait = _retry_wait(None, attempt)
             if _can_retry(attempt, wait):
+                # At temperature 0 an IDENTICAL retry replays the identical
+                # empty result, so each retry must change the request. First
+                # force hidden reasoning off — the usual cause is a reasoning
+                # model spending the whole max_tokens budget thinking (exactly
+                # what the vision pass hit), and it makes the retry strictly
+                # cheaper. If reasoning is already off, nudge the sampling off
+                # the degenerate path instead.
+                if "reasoning" not in body:
+                    body["reasoning"] = {"enabled": False}
+                elif body.get("temperature", 0.0) == 0.0:
+                    body["temperature"] = 0.3
+                try:
+                    finish = data["choices"][0].get("finish_reason")
+                except (KeyError, IndexError, TypeError, AttributeError):
+                    finish = None
                 logger.warning(
                     "OpenRouter returned empty content on a JSON call "
-                    "(attempt %d/%d); retrying in %.1fs",
-                    attempt, _MAX_ATTEMPTS, wait,
+                    "(attempt %d/%d, finish_reason=%s); retrying in %.1fs "
+                    "with reasoning disabled",
+                    attempt, _MAX_ATTEMPTS, finish, wait,
                 )
                 time.sleep(wait)
                 continue
@@ -453,20 +469,25 @@ def call_llm_json(prompt: str, system: str | None = None, temperature: float = 0
     # whole rule set or issue list. The client already retries transport errors;
     # this covers a one-off bad body.
     logger.warning("LLM returned unparseable JSON (%d chars); retrying once.", len(raw or ""))
+    # disable_reasoning=True on the clean retry: hidden chain-of-thought adds
+    # nothing to strict-JSON emission, is the main cause of empty/truncated
+    # bodies (the budget gets spent thinking), and only makes the call cheaper.
     raw = call_llm(prompt, system=system, json_mode=True, temperature=temperature,
                    max_prompt_bytes=max_prompt_bytes, max_tokens=token_budget,
                    read_timeout=read_timeout, retry_budget=retry_budget,
-                   model=model, images=images, disable_reasoning=disable_reasoning)
+                   model=model, images=images, disable_reasoning=True)
     obj = _loads_lenient(raw)
     if obj is not None:
         return obj
     if not (raw or "").strip():
-        # An empty body after every retry (a provider glitch, or a reasoning
-        # model that spent its whole output budget thinking). Say so plainly —
-        # the old message ended in a blank line and read as a mystery.
+        # An empty body survived every retry — including the retries that
+        # disabled hidden reasoning and re-jittered the sampling — so this is a
+        # genuine provider outage for this model, not the token-budget failure
+        # mode (which the retries now fix in place).
         raise RuntimeError(
-            "LLM returned an EMPTY response after retries — the provider "
-            "glitched or spent the output-token budget. Retrying the run "
-            "usually clears it."
+            "LLM returned an EMPTY response on every retry (even with "
+            "reasoning disabled) — the provider is glitching on this model "
+            "right now. Rerun shortly, or point MODEL at a different slug "
+            "if it persists."
         )
     raise RuntimeError(f"LLM did not return valid JSON:\n{redact(raw)[:500]}")
